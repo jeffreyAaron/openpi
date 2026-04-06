@@ -205,6 +205,89 @@ class ResizeImages(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class GaussianActionNoise(DataTransformFn):
+    """Adds Gaussian noise to actions during training for regularization."""
+
+    std: float = 0.01
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or self.std <= 0:
+            return data
+        actions = data["actions"]
+        noise = np.random.normal(0, self.std, size=actions.shape).astype(actions.dtype)
+        data["actions"] = actions + noise
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class RandomImageAugmentation(DataTransformFn):
+    """Applies random crop, rotation, and color jitter to all images in the batch.
+
+    Each image gets an independent random augmentation every time.
+    """
+
+    # Random crop: fraction of the image to keep (1.0 = no crop).
+    crop_scale_min: float = 0.9
+    # Max rotation in degrees.
+    max_rotation_deg: float = 5.0
+    # Color jitter strength (0.0 = no jitter).
+    brightness_delta: float = 0.1
+    contrast_range: float = 0.1
+    saturation_range: float = 0.1
+    hue_delta: float = 0.02
+
+    def _augment(self, image: np.ndarray) -> np.ndarray:
+        """Augment a single (H, W, 3) uint8 image."""
+        import cv2
+
+        h, w = image.shape[:2]
+
+        # --- Random crop (resize back to original) ---
+        scale = np.random.uniform(self.crop_scale_min, 1.0)
+        crop_h, crop_w = int(h * scale), int(w * scale)
+        top = np.random.randint(0, h - crop_h + 1)
+        left = np.random.randint(0, w - crop_w + 1)
+        image = image[top : top + crop_h, left : left + crop_w]
+        image = cv2.resize(image, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # --- Random rotation ---
+        angle = np.random.uniform(-self.max_rotation_deg, self.max_rotation_deg)
+        M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+        image = cv2.warpAffine(image, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
+
+        # --- Color jitter (work in float) ---
+        img_f = image.astype(np.float32)
+
+        # Brightness
+        img_f += np.random.uniform(-self.brightness_delta, self.brightness_delta) * 255.0
+
+        # Contrast
+        factor = np.random.uniform(1.0 - self.contrast_range, 1.0 + self.contrast_range)
+        mean = img_f.mean()
+        img_f = (img_f - mean) * factor + mean
+
+        # Saturation
+        gray = np.mean(img_f, axis=2, keepdims=True)
+        s_factor = np.random.uniform(1.0 - self.saturation_range, 1.0 + self.saturation_range)
+        img_f = gray + (img_f - gray) * s_factor
+
+        # Hue (rotate hue channel in HSV)
+        img_u8 = np.clip(img_f, 0, 255).astype(np.uint8)
+        hsv = cv2.cvtColor(img_u8, cv2.COLOR_RGB2HSV).astype(np.float32)
+        hsv[..., 0] += np.random.uniform(-self.hue_delta, self.hue_delta) * 180.0
+        hsv[..., 0] = np.mod(hsv[..., 0], 180.0)
+        image = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+        return image
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "image" not in data:
+            return data
+        data["image"] = {k: self._augment(v) for k, v in data["image"].items()}
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class SubsampleActions(DataTransformFn):
     stride: int
 

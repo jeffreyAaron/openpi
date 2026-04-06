@@ -575,12 +575,58 @@ class LeRobotBimanualYAMDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+# @dataclasses.dataclass(frozen=True)
+# class LeRobotTSHDataConfig(DataConfigFactory):
+#     """
+#     Data config for the TSH bimanual Franka robot (16 DOF: 7 joints + 1 gripper per arm).
+#     Mirrors LeRobotBimanualYAMDataConfig but uses TSHInputs/TSHOutputs transforms.
+#     """
+#
+#     @override
+#     def create(self, asset_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+#         repack_transform = _transforms.Group(
+#             inputs=[
+#                 _transforms.RepackTransform(
+#                     {
+#                         "state": "state",
+#                         "exo_image": "exo_image",
+#                         "wrist_right_image": "wrist_right_image",
+#                         "wrist_left_image": "wrist_left_image",
+#                         "actions": "actions",
+#                         "prompt": "prompt",
+#                     }
+#                 )
+#             ]
+#         )
+#
+#         data_transforms = _transforms.Group(
+#             inputs=[tsh_policy.TSHInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+#             outputs=[tsh_policy.TSHOutputs()],
+#         )
+#         data_transforms = data_transforms.push(
+#             inputs=[_transforms.CropImages(_model.IMAGE_RESOLUTION[1] / _model.IMAGE_RESOLUTION[0])],
+#             outputs=[],
+#         )
+#
+#         model_transforms = ModelTransformFactory()(model_config)
+#
+#         return dataclasses.replace(
+#             self.create_base_config(asset_dirs, model_config),
+#             repack_transforms=repack_transform,
+#             data_transforms=data_transforms,
+#             model_transforms=model_transforms,
+#         )
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotTSHDataConfig(DataConfigFactory):
     """
     Data config for the TSH bimanual Franka robot (16 DOF: 7 joints + 1 gripper per arm).
-    Mirrors LeRobotBimanualYAMDataConfig but uses TSHInputs/TSHOutputs transforms.
+    Absolute action space with data augmentation (Gaussian action noise + image augmentations).
     """
+
+    # Standard deviation for Gaussian noise on actions.
+    action_noise_std: float = 0.05
 
     @override
     def create(self, asset_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -603,8 +649,15 @@ class LeRobotTSHDataConfig(DataConfigFactory):
             inputs=[tsh_policy.TSHInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
             outputs=[tsh_policy.TSHOutputs()],
         )
+
+        # Absolute actions: no DeltaActions/AbsoluteActions transforms needed.
+        # Add image augmentation (random crop/rotate/color jitter) and action noise.
         data_transforms = data_transforms.push(
-            inputs=[_transforms.CropImages(_model.IMAGE_RESOLUTION[1] / _model.IMAGE_RESOLUTION[0])],
+            inputs=[
+                _transforms.CropImages(_model.IMAGE_RESOLUTION[1] / _model.IMAGE_RESOLUTION[0]),
+                _transforms.RandomImageAugmentation(),
+                _transforms.GaussianActionNoise(std=self.action_noise_std),
+            ],
             outputs=[],
         )
 
@@ -1180,24 +1233,44 @@ _CONFIGS = [
         resume=False,
         overwrite=True,
     ),
+    # TrainConfig(
+    #     name="pi05_tsh",
+    #     project_name="openpi_tsh",
+    #     model=pi0_config.Pi0Config(action_dim=32, action_horizon=50, max_token_len=250, pi05=True),
+    #     data=LeRobotTSHDataConfig(
+    #         repo_id="tsh_dataset1",
+    #         assets=AssetsConfig(),
+    #         base_config=DataConfig(
+    #             prompt_from_task=True,
+    #         ),
+    #     ),
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    #     num_train_steps=80_000,
+    #     num_workers=16,
+    #     save_interval=5_000,
+    #     keep_period=10_000,
+    #     resume=False,
+    #     overwrite=True,
+    # ),
     TrainConfig(
         name="pi05_tsh",
         project_name="openpi_tsh",
         model=pi0_config.Pi0Config(action_dim=32, action_horizon=50, max_token_len=250, pi05=True),
         data=LeRobotTSHDataConfig(
             repo_id="tsh_dataset1",
+            action_noise_std=0.05,
             assets=AssetsConfig(),
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/kavishk/openpi/checkpoints/pi05_tsh/tsh1/20000/params"),
         num_train_steps=80_000,
         num_workers=16,
         save_interval=5_000,
         keep_period=10_000,
-        resume=True,
-        overwrite=False,
+        resume=False,
+        overwrite=True,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
