@@ -5,13 +5,23 @@ and adapts it to the RLEnvironment interface expected by the RLT training loop.
 
 Handles:
 - Camera name mapping (robosuite -> openpi canonical names)
-- Image resizing (512x512 -> target size for VLA)
+- Visual + control defaults aligned with ``groundTruthEval`` (opencv image convention,
+  ``panda_joint_ctrl_slow.json``) so the frozen VLA sees the same pixels and dynamics
+  as in high-accuracy eval
+- Optional image resize (default: full-res, policy applies ``resize_with_pad`` like eval)
+- Optional ``handover_index.json`` tape layouts (match training / ``groundTruthEval``)
+- Observations from ``FrankaRobosuiteTapeHandover.get_observation()`` like eval
 - Proprioception extraction (16D bimanual Franka state)
 - Single-step action interface via robosuite_env.step()
+- First ``reset()`` with tape layout index ``0`` skips a redundant inner ``reset()`` so the
+  initial observation matches ``groundTruthEval`` (Franka ``__init__`` already reset with
+  ``_tape_combos[0]``); later episodes always full-reset the scene.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -20,6 +30,66 @@ import cv2
 import numpy as np
 
 from openpi.rlt.env_interface import RLEnvironment
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Valid tape position grid (mirrors sweep_handover_offsets.sh exactly)
+#
+# Each tape uses a 4×2 grid → 8 positions per tape → 64 valid (yellow, duct)
+# combinations total.
+#
+# Yellow tape:  x ∈ [-0.2, 0.1] (4 steps), y ∈ [0.25, 0.5]  (2 steps)
+# Duct tape:    x ∈ [-0.2, 0.1] (4 steps), y ∈ [-0.5, -0.25] (2 steps)
+# ---------------------------------------------------------------------------
+def _linspace(lo: float, hi: float, n: int) -> list[float]:
+    if n == 1:
+        return [lo]
+    step = (hi - lo) / (n - 1)
+    return [round(lo + i * step, 6) for i in range(n)]
+
+_YELLOW_X_VALS = _linspace(-0.2, 0.1, 4)   # -0.2, -0.1, 0.0, 0.1
+_YELLOW_Y_VALS = _linspace(0.25, 0.5, 2)   # 0.25, 0.5
+_DUCT_X_VALS   = _linspace(-0.2, 0.1, 4)   # -0.2, -0.1, 0.0, 0.1
+_DUCT_Y_VALS   = _linspace(-0.5, -0.25, 2) # -0.5, -0.25
+
+_VALID_YELLOW: list[tuple[float, float]] = [
+    (x, y) for x in _YELLOW_X_VALS for y in _YELLOW_Y_VALS
+]  # 8 positions
+_VALID_DUCT: list[tuple[float, float]] = [
+    (x, y) for x in _DUCT_X_VALS for y in _DUCT_Y_VALS
+]  # 8 positions
+
+# All 64 valid (yellow, duct) pairs — the same set swept by sweep_handover_offsets.sh.
+_VALID_COMBOS: list[tuple[tuple[float, float], tuple[float, float]]] = [
+    (yellow, duct) for yellow in _VALID_YELLOW for duct in _VALID_DUCT
+]
+
+_RESET_MAX_ATTEMPTS = 3  # initial attempt + 2 retries
+
+
+def load_tape_combos_from_handover_json(path: str | Path) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Load tape layouts from the same JSON schema as ``groundTruthEval.offsets_json_path``.
+
+    Each entry must have ``yellow_x``, ``yellow_y``, ``duct_x``, ``duct_y`` (floats).
+    Using the dataset / eval index file ensures rollouts hit the **same** XY pairs the
+    VLA was trained on; the built-in 4×4 linspace grid can differ slightly in float
+    values and ordering.
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Tape offsets JSON not found: {p}")
+    with p.open() as f:
+        data = json.load(f)
+    combos: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for entry in data:
+        combos.append(
+            (
+                (float(entry["yellow_x"]), float(entry["yellow_y"])),
+                (float(entry["duct_x"]), float(entry["duct_y"])),
+            )
+        )
+    return combos
 
 # Add robosuite fork to path if not already importable.
 _ROBOSUITE_PATH = Path.home() / "mike" / "dependencies" / "robosuite"
@@ -35,6 +105,101 @@ _CAMERA_MAP = {
 }
 
 
+def _resolve_controller_cfg(controller_cfg: str) -> str:
+    """Turn controller paths into an absolute file path for robosuite's loader.
+
+    Robosuite opens ``*.json`` paths as-is; defaults like
+    ``robosuite/environments/custom/configs/...`` only work when cwd is the
+    robosuite repo root. Anchor relative paths to the ``robosuite`` package
+    directory instead.
+    """
+    path = Path(controller_cfg)
+    if path.is_file():
+        return str(path.resolve())
+    import robosuite
+
+    pkg_root = Path(robosuite.__file__).resolve().parent
+    rel = controller_cfg.replace("\\", "/")
+    if rel.startswith("robosuite/"):
+        rel = rel.split("/", 1)[1]
+    candidate = (pkg_root / rel).resolve()
+    if not candidate.is_file():
+        raise FileNotFoundError(
+            f"Robosuite controller config not found: {controller_cfg!r} "
+            f"(resolved to {candidate}; robosuite package root {pkg_root})"
+        )
+    return str(candidate)
+
+
+def _ensure_robosuite_opencv_image_convention() -> None:
+    """Use the same camera convention as ``groundTruthEval`` (``suite.macros.IMAGE_CONVENTION``).
+
+    Robosuite applies a vertical flip inside the camera sensor when this is ``opencv``,
+    producing upright RGB. Without it (default ``opengl``), a second flip in the env
+    wrapper was used historically — that diverges from eval, which does not flip again
+    after setting ``opencv``.
+    """
+    import robosuite
+
+    robosuite.macros.IMAGE_CONVENTION = "opencv"
+
+
+def sanitize_bimanual_panda_action(action: np.ndarray) -> np.ndarray:
+    """Prepare a 16D action for ``TwoArmTapeHandover.step``.
+
+    Arm joints (dims 0-6 and 8-14) are absolute joint positions in radians.
+    Gripper dims 7 and 15 must stay in [-1, 1] for robosuite's GRIP controller:
+    approximately -1 = open, +1 = closed (matches ``format_proprio`` and
+    ``FrankaRobosuiteTapeHandover``'s internal ``1.0 - 2 * opening_fraction``).
+
+    Values outside [-1, 1] on gripper channels (common from unbounded RL actor
+    heads) are clipped so the fingers still receive valid controller commands.
+    """
+    a = np.asarray(action, dtype=np.float64).reshape(-1)
+    if a.size != 16:
+        raise ValueError(
+            f"Expected 16-dim bimanual action, got shape {np.asarray(action).shape}"
+        )
+    a = a.copy()
+    a[7] = float(np.clip(a[7], -1.0, 1.0))
+    a[15] = float(np.clip(a[15], -1.0, 1.0))
+    return a
+
+
+def apply_gripper_zero_hold(
+    action: np.ndarray,
+    last_grip_cmds: np.ndarray,
+    *,
+    eps: float = 0.02,
+) -> np.ndarray:
+    """Avoid stalling Panda grippers when the policy emits near-zero gripper targets.
+
+    Robosuite's ``PandaGripper.format_action`` updates fingers using ``np.sign(cmd)``
+    (incremental motion). If ``cmd`` is exactly ~0, ``sign(0)=0`` and the gripper does
+    not move — common with flow-matching noise or blended actions that average toward 0.
+
+    For each gripper dim (7 and 15), if ``|cmd| < eps``, reuse ``last_grip_cmds``;
+    otherwise clip to [-1, 1], write back to ``last_grip_cmds``, and use that value.
+    Initialize ``last_grip_cmds`` from proprio (state[7], state[15]) at episode start.
+    """
+    a = np.asarray(action, dtype=np.float64).reshape(-1).copy()
+    if a.size != 16:
+        raise ValueError(
+            f"Expected 16-dim bimanual action, got shape {np.asarray(action).shape}"
+        )
+    if last_grip_cmds.shape != (2,):
+        raise ValueError("last_grip_cmds must be shape (2,) for [left, right] grippers.")
+    for i, idx in enumerate((7, 15)):
+        v = float(a[idx])
+        if abs(v) < eps:
+            a[idx] = float(np.clip(last_grip_cmds[i], -1.0, 1.0))
+        else:
+            c = float(np.clip(v, -1.0, 1.0))
+            last_grip_cmds[i] = c
+            a[idx] = c
+    return a
+
+
 def format_proprio(
     obs: dict,
     gripper_qpos_max: float = 0.08,
@@ -43,7 +208,8 @@ def format_proprio(
     """Convert robosuite obs dict to 16D proprioceptive vector.
 
     Layout: [left_j0..6, left_gripper, right_j0..6, right_gripper]
-    Gripper encoding: +1.0 = fully open, -1.0 = fully closed.
+    Gripper encoding (from finger qpos span): about -1.0 = open, +1.0 = closed,
+    aligned with the GRIP action convention above.
     """
     span = gripper_qpos_max - gripper_qpos_min
     left_raw = float(np.sum(np.abs(obs["robot0_gripper_qpos"])))
@@ -62,26 +228,63 @@ class RobosuiteRLTEnv(RLEnvironment):
     """RLT-compatible wrapper around FrankaRobosuiteTapeHandover.
 
     Args:
-        controller_cfg: Path to the robosuite controller config JSON.
-        image_size: Target image size (images are resized from 512x512).
+        controller_cfg: Path to the robosuite controller config JSON. Default matches
+            ``groundTruthEval`` (``panda_joint_ctrl_slow.json``); the stiffer
+            ``panda_joint_ctrl.json`` makes the same policy targets track very differently.
+        image_size: If set, resize square RGB to this side length (cv2 linear). If ``None``,
+            pass native camera resolution through — same as eval, letting the policy's
+            ``ResizeImages`` / ``resize_with_pad`` handle downscaling.
         use_wrist_cameras: Whether to enable wrist cameras.
         max_steps: Maximum steps per episode.
         seed: Random seed for the environment.
+        tape_offsets_json: If set, load yellow/duct XY pairs from this file (eval / dataset
+            index). Otherwise use the built-in 64-combo linspace grid.
+        contact_solref: If set, assign all ``geom_solref`` to this ``[timeconst, dampratio]``
+            pair (same as ``groundTruthEval``).
+        contact_solimp: If set, assign ``geom_solimp[:, :n]`` for the first ``n`` columns
+            (e.g. three values for ``[dmin, dmax, width]``).
+
+    Note:
+        On the first call to :meth:`reset`, if the chosen tape layout index is ``0`` (from
+        ``tape_layout_index=0`` or random sampling), the inner ``Franka.reset()`` is skipped:
+        ``__init__`` already ran a full mujoco reset with ``_tape_combos[0]``, matching
+        ``groundTruthEval``. Later ``reset`` calls always re-randomize the scene.
     """
 
     def __init__(
         self,
-        controller_cfg: str = "robosuite/environments/custom/configs/panda_joint_ctrl.json",
-        image_size: int = 224,
+        controller_cfg: str = "robosuite/environments/custom/configs/panda_joint_ctrl_slow.json",
+        image_size: int | None = None,
         use_wrist_cameras: bool = True,
         max_steps: int = 1800,
         seed: int | None = None,
+        tape_offsets_json: str | Path | None = None,
+        contact_solref: list[float] | None = None,
+        contact_solimp: list[float] | None = None,
+        tape_layout_index: int | None = None,
+        gripper_action_log: str | Path | None = None,
     ) -> None:
+        _ensure_robosuite_opencv_image_convention()
         from robosuite.environments.custom.franka_robosuite_tape_handover import (
             FrankaRobosuiteTapeHandover,
         )
 
         self.image_size = image_size
+        self._rng = np.random.default_rng(seed)
+        if tape_offsets_json is not None:
+            self._tape_combos = load_tape_combos_from_handover_json(tape_offsets_json)
+            logger.info(
+                "RobosuiteRLTEnv: using %d tape layouts from %s",
+                len(self._tape_combos),
+                tape_offsets_json,
+            )
+        else:
+            self._tape_combos = _VALID_COMBOS
+
+        # Pick the first valid combo so the construction-time reset succeeds.
+        (yellow_x, yellow_y), (duct_x, duct_y) = self._tape_combos[0]
+
+        controller_cfg = _resolve_controller_cfg(controller_cfg)
         self.env = FrankaRobosuiteTapeHandover(
             controller_cfg=controller_cfg,
             viser_debug=False,
@@ -90,11 +293,41 @@ class RobosuiteRLTEnv(RLEnvironment):
             use_wrist_cameras=use_wrist_cameras,
             max_steps=max_steps,
             seed=seed,
+            yellow_tape_offset=[yellow_x, yellow_y, 0.0],
+            duct_tape_offset=[duct_x, duct_y, 0.0],
         )
+        self._apply_contact_overrides(contact_solref, contact_solimp)
         self._raw_obs: dict[str, Any] = {}
+        self._last_grip_cmd = np.array([1.0, 1.0], dtype=np.float64)
+        self._tape_layout_index = tape_layout_index
+        self._gripper_action_log_path = (
+            str(Path(gripper_action_log).resolve()) if gripper_action_log else None
+        )
+        self._gripper_log_episode_idx = 0
+        self._gripper_log_local_step = 0
+        # True until the first :meth:`reset` completes. Used to avoid a second full mujoco reset
+        # when the first episode uses layout 0 — same as ``groundTruthEval`` after Franka __init__.
+        self._first_reset_after_construct = True
+
+    def _apply_contact_overrides(
+        self,
+        contact_solref: list[float] | None,
+        contact_solimp: list[float] | None,
+    ) -> None:
+        """Match ``groundTruthEval`` sim_worker contact tweaks when provided."""
+        rs = self.env.robosuite_env
+        if contact_solref is not None:
+            solref = np.array(contact_solref, dtype=np.float64)
+            rs.sim.model.geom_solref[:] = solref
+        if contact_solimp is not None:
+            solimp = np.array(contact_solimp, dtype=np.float64)
+            n = len(solimp)
+            rs.sim.model.geom_solimp[:, :n] = solimp
 
     def _resize_image(self, image: np.ndarray) -> np.ndarray:
         """Resize image to target size using bilinear interpolation."""
+        if self.image_size is None:
+            return image
         if image.shape[0] == self.image_size and image.shape[1] == self.image_size:
             return image
         return cv2.resize(
@@ -105,13 +338,14 @@ class RobosuiteRLTEnv(RLEnvironment):
         """Convert raw robosuite observations to openpi canonical format."""
         obs: dict[str, Any] = {}
 
-        # Map and resize camera images.
+        # Map and optionally resize camera images. Orientation comes from
+        # ``IMAGE_CONVENTION=opencv`` (see ``_ensure_robosuite_opencv_image_convention``),
+        # matching ``groundTruthEval`` — do not flip here.
         for rs_key, canonical_key in _CAMERA_MAP.items():
             if rs_key in raw_obs:
                 image = raw_obs[rs_key]
-                # Robosuite images may need vertical flip (opencv convention).
                 if image.ndim == 3 and image.shape[2] == 3:
-                    obs[canonical_key] = self._resize_image(image)
+                    obs[canonical_key] = self._resize_image(np.asarray(image))
                 else:
                     obs[canonical_key] = image
 
@@ -120,11 +354,91 @@ class RobosuiteRLTEnv(RLEnvironment):
 
         return obs
 
+    def _update_tape_positions(self, yellow_x: float, yellow_y: float, duct_x: float, duct_y: float) -> None:
+        """Set the next episode's tape XY from the valid grid.
+
+        ``TwoArmTapeHandover`` uses ``yellow_tape_offset`` / ``duct_tape_offset`` when
+        building placement samplers. With ``hard_reset=True`` (robosuite default), every
+        ``reset()`` calls ``_load_model()`` → ``_get_placement_initializer()`` and **rebuilds**
+        those samplers from these offsets. Mutating only the old sampler objects is ignored
+        after the first reset, which is why tape poses looked fixed across episodes.
+
+        We update both the stored offsets (for hard reset) and, when samplers already exist,
+        their ranges (for soft-reset / consistency).
+        """
+        rs = self.env.robosuite_env
+        rs.yellow_tape_offset = np.array([yellow_x, yellow_y, float(rs.yellow_tape_offset[2])], dtype=np.float64)
+        rs.duct_tape_offset = np.array([duct_x, duct_y, float(rs.duct_tape_offset[2])], dtype=np.float64)
+
+        if rs.placement_initializer is not None and hasattr(rs.placement_initializer, "samplers"):
+            samplers = rs.placement_initializer.samplers
+            if "YellowTapeSampler" in samplers:
+                s_yellow = samplers["YellowTapeSampler"]
+                s_yellow.x_range = [yellow_x, yellow_x]
+                s_yellow.y_range = [yellow_y, yellow_y]
+            if "DuctTapeSampler" in samplers:
+                s_duct = samplers["DuctTapeSampler"]
+                s_duct.x_range = [duct_x, duct_x]
+                s_duct.y_range = [duct_y, duct_y]
+
     def reset(self) -> dict[str, Any]:
-        """Reset the environment."""
-        _obs, _info = self.env.reset()
-        self._raw_obs = self.env.robosuite_env._get_observations()
-        return self._format_obs(self._raw_obs)
+        """Reset the environment, randomizing tape positions from the valid grid.
+
+        The first successful reset with layout index ``0`` does **not** call
+        ``FrankaRobosuiteTapeHandover.reset()`` again: the inner env was already fully reset in
+        ``__init__`` with ``_tape_combos[0]``, matching ``groundTruthEval`` before the first
+        policy step. All later resets always call the inner ``reset()``.
+
+        Retries up to ``_RESET_MAX_ATTEMPTS - 1`` extra times on
+        ``RandomizationError`` before re-raising.
+        """
+        from robosuite.utils.errors import RandomizationError
+
+        last_exc: Exception | None = None
+        for attempt in range(_RESET_MAX_ATTEMPTS):
+            if self._tape_layout_index is not None:
+                idx = int(self._tape_layout_index) % len(self._tape_combos)
+            else:
+                idx = int(self._rng.integers(len(self._tape_combos)))
+            (yellow_x, yellow_y), (duct_x, duct_y) = self._tape_combos[idx]
+            self._update_tape_positions(yellow_x, yellow_y, duct_x, duct_y)
+
+            try:
+                if self._first_reset_after_construct and idx == 0 and attempt == 0:
+                    # Inner Franka already ran ``robosuite_env.reset()`` in ``__init__`` for
+                    # ``_tape_combos[0]``.  ``groundTruthEval.sim_worker`` uses that state for the
+                    # first inference; do not re-sample initialization noise a second time.
+                    self._raw_obs = self.env.get_observation()
+                else:
+                    _obs, _info = self.env.reset()
+                    # Match ``groundTruthEval`` / Franka API (not raw ``_get_observations``).
+                    self._raw_obs = self.env.get_observation()
+                self._first_reset_after_construct = False
+                out = self._format_obs(self._raw_obs)
+                st = out["state"]
+                self._last_grip_cmd = np.array([float(st[7]), float(st[15])], dtype=np.float64)
+                self._gripper_log_local_step = 0
+                if self._gripper_action_log_path:
+                    mode = "w" if self._gripper_log_episode_idx == 0 else "a"
+                    with open(self._gripper_action_log_path, mode, encoding="utf-8") as gf:
+                        if self._gripper_log_episode_idx == 0:
+                            gf.write("step,gripper_left_dim7,gripper_right_dim15\n")
+                        else:
+                            gf.write(f"\n# episode {self._gripper_log_episode_idx}\n")
+                    self._gripper_log_episode_idx += 1
+                return out
+            except RandomizationError as exc:
+                last_exc = exc
+                logger.warning(
+                    "Placement randomization failed (attempt %d/%d) for "
+                    "yellow=(%.3f, %.3f) duct=(%.3f, %.3f): %s",
+                    attempt + 1, _RESET_MAX_ATTEMPTS,
+                    yellow_x, yellow_y, duct_x, duct_y, exc,
+                )
+
+        raise RuntimeError(
+            f"Environment reset failed after {_RESET_MAX_ATTEMPTS} attempts"
+        ) from last_exc
 
     def step(self, action: np.ndarray) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
         """Execute a single action step.
@@ -135,8 +449,17 @@ class RobosuiteRLTEnv(RLEnvironment):
         Returns:
             obs, reward, done, info.
         """
-        self.env.robosuite_env.step(action)
-        self._raw_obs = self.env.robosuite_env._get_observations()
+        a = sanitize_bimanual_panda_action(
+            apply_gripper_zero_hold(np.asarray(action), self._last_grip_cmd),
+        )
+        if self._gripper_action_log_path:
+            with open(self._gripper_action_log_path, "a", encoding="utf-8") as gf:
+                gf.write(
+                    f"{self._gripper_log_local_step},{a[7]:.8f},{a[15]:.8f}\n",
+                )
+            self._gripper_log_local_step += 1
+        self.env.robosuite_env.step(a)
+        self._raw_obs = self.env.get_observation()
         obs = self._format_obs(self._raw_obs)
 
         reward = 1.0 if self.task_completed() else 0.0

@@ -1,6 +1,7 @@
 import logging
 import os
 import pathlib
+from collections.abc import Sequence
 from typing import Any
 
 import jax.numpy as jnp
@@ -12,6 +13,18 @@ from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 import openpi.transforms as transforms
 
+_TRAIN_ONLY_DATA_INPUT_TRANSFORMS: tuple[type, ...] = (
+    transforms.RandomImageAugmentation,
+    transforms.GaussianActionNoise,
+)
+
+
+def _data_inputs_without_train_augmentation(
+    data_inputs: Sequence[transforms.DataTransformFn],
+) -> tuple[transforms.DataTransformFn, ...]:
+    """Drop transforms that should run in the dataloader only, not at sim inference."""
+    return tuple(t for t in data_inputs if not isinstance(t, _TRAIN_ONLY_DATA_INPUT_TRANSFORMS))
+
 
 def create_trained_policy(
     train_config: _config.TrainConfig,
@@ -22,6 +35,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    skip_train_data_input_transforms: bool = False,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -37,6 +51,9 @@ def create_trained_policy(
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
+        skip_train_data_input_transforms: If True, drop ``RandomImageAugmentation`` and
+            ``GaussianActionNoise`` from the policy input pipeline. Use for sim / eval rollouts;
+            those belong in the training dataloader only.
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
@@ -72,12 +89,23 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    data_inputs = data_config.data_transforms.inputs
+    if skip_train_data_input_transforms:
+        filtered = _data_inputs_without_train_augmentation(data_inputs)
+        if len(filtered) != len(data_inputs):
+            logging.info(
+                "Policy input pipeline: skipping %d train-only data transform(s) "
+                "(RandomImageAugmentation / GaussianActionNoise).",
+                len(data_inputs) - len(filtered),
+            )
+        data_inputs = filtered
+
     return _policy.Policy(
         model,
         transforms=[
             *repack_transforms.inputs,
             transforms.InjectDefaultPrompt(default_prompt),
-            *data_config.data_transforms.inputs,
+            *data_inputs,
             transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],

@@ -71,10 +71,14 @@ class GaussianActor(nn.Module):
             sampled: [B, C*d] sampled actions (mean + noise).
             mean: [B, C*d] action mean (deterministic component).
         """
-        x = torch.cat([z_rl, state, ref_actions], dim=-1)
-        mean = self.mlp(x)
+        mean = self.forward_mean(z_rl, state, ref_actions)
         noise = torch.randn_like(mean) * self.fixed_std
         return mean + noise, mean
+
+    def forward_mean(self, z_rl: Tensor, state: Tensor, ref_actions: Tensor) -> Tensor:
+        """Deterministic action mean μ(x, a_ref) without exploration noise."""
+        x = torch.cat([z_rl, state, ref_actions], dim=-1)
+        return self.mlp(x)
 
 
 class TwinQCritic(nn.Module):

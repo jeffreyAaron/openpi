@@ -46,7 +46,7 @@ def preprocess_observation_pytorch(
             image = image.permute(0, 2, 3, 1)
 
         if image.shape[1:3] != image_resolution:
-            logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
+            # logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad_torch(image, *image_resolution)
 
         if train:

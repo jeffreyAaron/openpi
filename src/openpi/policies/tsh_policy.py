@@ -33,7 +33,8 @@ class TSHInputs(transforms.DataTransformFn):
     Input transform for the TSH bimanual Franka robot.
 
     State (16D): [left_joint_0..6, left_gripper, right_joint_0..6, right_gripper]
-    Actions (16D): gello teleoperator commanded positions (same layout as state)
+    Actions (16D): same layout; arm joints are absolute radians, grippers ~[-1,1]
+    for robosuite GRIP (-1 ≈ open, +1 ≈ closed), matching state encoding.
     """
 
     action_dim: int

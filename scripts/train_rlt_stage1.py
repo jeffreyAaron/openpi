@@ -17,11 +17,19 @@ Usage:
         --vla_checkpoint_path /path/to/base/vla/checkpoint \
         --joint_vla_finetune \
         --exp_name rlt_stage1_joint
+
+    # Local LeRobot dataset (overrides the Hub repo_id baked into the named config):
+    uv run scripts/train_rlt_stage1.py \
+        --vla_config_name pi05_tsh \
+        --lerobot_repo_id /path/to/lerobot_dataset_root \
+        --vla_checkpoint_path /path/to/vla/checkpoint \
+        --exp_name rlt_stage1
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import os
 import pathlib
@@ -64,6 +72,13 @@ def init_logging() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RLT Stage 1: RL Token Training")
     parser.add_argument("--vla_config_name", type=str, default="pi05_tsh")
+    parser.add_argument(
+        "--lerobot_repo_id",
+        type=str,
+        default=None,
+        help="LeRobot dataset: Hugging Face repo id (e.g. org/name) or absolute path to a local "
+        "LeRobot dataset root. If set, overrides repo_id from the selected --vla_config_name.",
+    )
     parser.add_argument("--vla_checkpoint_path", type=str, required=True)
     parser.add_argument("--exp_name", type=str, default="rlt_stage1")
     parser.add_argument("--checkpoint_base_dir", type=str, default="./checkpoints/rlt")
@@ -133,6 +148,13 @@ def train(args: argparse.Namespace) -> None:
 
     # --- Load VLA config and data ---
     train_config = _config.get_config(args.vla_config_name)
+    if args.lerobot_repo_id is not None:
+        repo = os.path.expanduser(args.lerobot_repo_id)
+        train_config = dataclasses.replace(
+            train_config,
+            data=dataclasses.replace(train_config.data, repo_id=repo),
+        )
+        logger.info("Using LeRobot repo_id override: %s", repo)
     # Override batch size.
     train_config = _config.TrainConfig(
         **{

@@ -58,10 +58,19 @@ class Stage2Config:
     action_dim: int = 16  # d: per-timestep action dim (TSH bimanual Franka = 16).
     stride: int = 2  # Subsampling stride for replay buffer.
 
+    # --- Rollout action smoothing (groundTruthEval-style; toggle with action_smoothing) ---
+    # none: one VLA+actor call every rl_chunk_length steps, no overlap smoothing.
+    # temporal_ensembling | ema_overlap: re-infer every inference_frequency <= rl_chunk_length steps.
+    action_smoothing: str = "none"
+    inference_frequency: int = 10  # Steps between VLA+actor calls when smoothing is enabled.
+    te_k: float = 0.1  # Temporal ensembling decay (higher = favor newest chunk less).
+    ema_alpha: float = 0.75  # New-chunk weight in overlap EMA (ema_overlap mode).
+
     # --- Actor network ---
     actor_hidden_dim: int = 256
     actor_num_layers: int = 2
-    actor_fixed_std: float = 0.1
+    actor_fixed_std: float = 0.03  # Exploration std when stochastic rollout / forward() sampling.
+    actor_stochastic_rollout: bool = False  # If True, rollout uses mean + noise; else mean only (less jitter).
     actor_lr: float = 3e-4
 
     # --- Critic network ---
@@ -72,14 +81,16 @@ class Stage2Config:
     # --- RL hyperparameters ---
     discount: float = 0.99
     tau: float = 0.005  # Target network soft update rate.
-    bc_reg_weight: float = 1.0  # beta: BC regularization toward VLA reference.
-    ref_action_dropout: float = 0.5  # Probability of zeroing ref actions in training.
+    bc_reg_weight: float = 5.0  # beta: BC toward VLA reference (mean MSE); higher = tighter anchor.
+    ref_action_dropout: float = 0.2  # Fraction of batch with ref zeroed during actor update (generalization).
     utd_ratio: int = 5  # Update-to-data ratio.
     critic_updates_per_actor: int = 2  # Critic updates per actor update.
 
     # --- Replay buffer ---
     buffer_capacity: int = 100_000
     batch_size: int = 256
+    # Warm-up uses the same rollout loop as post-warm-up; align chunk length + smoothing with GTE
+    # via train_rlt_stage2.py --match_ground_truth_eval_rollout (see script help).
     warmup_episodes: int = 20  # Episodes of VLA-only rollouts before RL starts.
 
     # --- Dimensions (derived from VLA + robot) ---
@@ -100,6 +111,12 @@ class Stage2Config:
     def action_chunk_dim(self) -> int:
         """Flattened action chunk dimension: C * d."""
         return self.rl_chunk_length * self.action_dim
+
+    def infer_every(self) -> int:
+        """Environment steps between VLA+actor forward passes during rollout."""
+        if self.action_smoothing == "none":
+            return self.rl_chunk_length
+        return self.inference_frequency
 
 
 @dataclass

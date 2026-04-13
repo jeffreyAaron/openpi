@@ -73,9 +73,11 @@ def resize_with_pad_torch(
     # Check if input is in channels-last format [*b, h, w, c] or channels-first [*b, c, h, w]
     if images.shape[-1] <= 4:  # Assume channels-last format
         channels_last = True
+        added_batch_for_resize = False
         # Convert to channels-first for torch operations
         if images.dim() == 3:
             images = images.unsqueeze(0)  # Add batch dimension
+            added_batch_for_resize = True
         images = images.permute(0, 3, 1, 2)  # [b, h, w, c] -> [b, c, h, w]
     else:
         channels_last = False
@@ -120,7 +122,7 @@ def resize_with_pad_torch(
     # Convert back to original format if needed
     if channels_last:
         padded_images = padded_images.permute(0, 2, 3, 1)  # [b, c, h, w] -> [b, h, w, c]
-        if batch_size == 1 and images.shape[0] == 1:
-            padded_images = padded_images.squeeze(0)  # Remove batch dimension if it was added
+        if added_batch_for_resize:
+            padded_images = padded_images.squeeze(0)
 
     return padded_images
