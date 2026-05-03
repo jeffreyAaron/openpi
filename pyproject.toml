@@ -31,6 +31,7 @@ dependencies = [
     "typing-extensions>=4.12.2",
     "tyro>=0.9.5",
     "wandb>=0.19.1",
+    "zstandard>=0.22",
     "filelock>=3.16.1",
     "beartype==0.19.0",
     "treescope>=0.1.7",
@@ -39,6 +40,7 @@ dependencies = [
     "polars>=1.30.0",
     "chex>=0.1.89",
     "gpustat>=1.1.1",
+    "viser>=1.0.26",
 ]
 
 
@@ -62,7 +64,12 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+# PyAV 14 wheels target FFmpeg 7 (libavformat.so.61); many Linux distros ship FFmpeg 6 (.so.60).
+override-dependencies = [
+    "ml-dtypes==0.4.1",
+    "tensorstore==0.1.74",
+    "av==12.3.0",
+]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }

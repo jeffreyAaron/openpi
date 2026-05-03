@@ -8,8 +8,10 @@ Usage:
     uv run scripts/train_rlt_stage2.py \
         --vla_config_name pi05_tsh \
         --vla_checkpoint_path /path/to/vla/checkpoint \
-        --rl_token_checkpoint_path /path/to/stage1/checkpoint/rl_token.safetensors \
+        --rl_token_checkpoint_path /path/to/stage1/checkpoint/rl_token.safetensors \\
         --exp_name rlt_stage2
+
+    ``--rl_token_checkpoint_path`` may be ``.safetensors`` (Stage 1 default) or ``.pt``.
 
 GTE-aligned warm-up / rollouts (full VLA horizon + same smoothing as groundTruthEval), e.g.:
     ... train_rlt_stage2.py ... --match_ground_truth_eval_rollout \\
@@ -60,6 +62,8 @@ from openpi.rlt.vla_wrapper import VLAEmbeddingExtractor
 
 
 logger = logging.getLogger(__name__)
+
+_RL_TOKEN_CFG_DEFAULTS = RLTokenModelConfig()
 
 
 def init_logging() -> None:
@@ -119,6 +123,13 @@ def parse_args() -> argparse.Namespace:
     # RL token model config (must match Stage 1).
     parser.add_argument("--encoder_layers", type=int, default=4)
     parser.add_argument("--encoder_heads", type=int, default=8)
+    parser.add_argument(
+        "--encoder_ff_dim",
+        type=int,
+        default=_RL_TOKEN_CFG_DEFAULTS.encoder_ff_dim,
+        help="Encoder FFN hidden dim (nn.TransformerEncoderLayer dim_feedforward). "
+        "Must match Stage 1. Checkpoint uses 4096 when linear1.weight has shape [4096, d_model].",
+    )
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--state_dim", type=int, default=16,
@@ -238,6 +249,29 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Append executed gripper cmds (after hold+sanitize) per env step as CSV (dims 7 and 15).",
+    )
+    parser.add_argument(
+        "--sim_states_dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory of pre-captured sim state snapshots produced by "
+            "misc_scripts/capture_sim_states.py (contains index.json, per-layout .npys or states.npz, "
+            "and model.xml (required). When set, each episode reset restores the sim to the mid-demo state "
+            "for the current tape layout. "
+            "Use the same robosuite controller JSON as capture (--controller-cfg), "
+            "and matching wrist-camera mode (default: wrist cams on; old captures "
+            "with --no-wrist-cameras require --robosuite_no_wrist_cameras on Stage 2)."
+        ),
+    )
+    parser.add_argument(
+        "--robosuite_no_wrist_cameras",
+        action="store_true",
+        help=(
+            "Build FrankaRobosuiteTapeHandover with agentview only (no wrist RGB). "
+            "Enable this only if your sim_states were captured with capture_sim_states.py "
+            "--no-wrist-cameras; otherwise leave unset so observations match the VLA."
+        ),
     )
     parser.add_argument(
         "--vla_train_augmentation_at_infer",
@@ -622,6 +656,35 @@ def log_rollout_wandb(
         wandb.log(log_dict, step=episode)
 
 
+def _load_rl_token_encoder_state_dict(ckpt_path: str, device: torch.device) -> dict[str, Any]:
+    """Load a state dict for `RLTokenEncoder` from Stage 1 RL token checkpoints.
+
+    Supports ``.safetensors`` (``save_model(RLTokenModule, ...)``) and PyTorch ``.pt``
+    (e.g. ``torch.save(module.state_dict(), ...)``). Strips an ``encoder.`` prefix
+    when the file contains a full ``RLTokenModule`` checkpoint so weights match
+    a standalone ``RLTokenEncoder``.
+    """
+    path = pathlib.Path(ckpt_path)
+    if path.suffix.lower() == ".safetensors":
+        raw: dict[str, Any] = safetensors.torch.load_file(str(path), device=str(device))
+    else:
+        try:
+            ckpt_obj = torch.load(path, map_location=device, weights_only=True)
+        except TypeError:
+            ckpt_obj = torch.load(path, map_location=device)
+        if not isinstance(ckpt_obj, dict):
+            raise TypeError(f"Expected a dict checkpoint at {path}, got {type(ckpt_obj)}")
+        if "state_dict" in ckpt_obj and isinstance(ckpt_obj["state_dict"], dict):
+            raw = ckpt_obj["state_dict"]
+        elif "encoder" in ckpt_obj and isinstance(ckpt_obj["encoder"], dict):
+            raw = ckpt_obj["encoder"]
+        else:
+            raw = ckpt_obj
+    if any(k.startswith("encoder.") for k in raw):
+        raw = {k[len("encoder.") :]: v for k, v in raw.items() if k.startswith("encoder.")}
+    return raw
+
+
 def train(args: argparse.Namespace) -> None:
     init_logging()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -745,10 +808,24 @@ def train(args: argparse.Namespace) -> None:
     rl_token_config = RLTokenModelConfig(
         encoder_layers=args.encoder_layers,
         encoder_heads=args.encoder_heads,
+        encoder_ff_dim=args.encoder_ff_dim,
     )
     encoder = RLTokenEncoder(rl_token_config).to(device)
-    # Load only encoder weights from the Stage 1 checkpoint.
-    safetensors.torch.load_model(encoder, args.rl_token_checkpoint_path, strict=False)
+    # Load only encoder weights from the Stage 1 checkpoint (.safetensors or .pt).
+    enc_state = _load_rl_token_encoder_state_dict(args.rl_token_checkpoint_path, device)
+    missing, unexpected = encoder.load_state_dict(enc_state, strict=False)
+    if missing:
+        logger.warning(
+            "RL token encoder: %d missing keys after load (showing up to 5): %s",
+            len(missing),
+            missing[:5],
+        )
+    if unexpected:
+        logger.warning(
+            "RL token encoder: %d unexpected keys after load (showing up to 5): %s",
+            len(unexpected),
+            unexpected[:5],
+        )
     for p in encoder.parameters():
         p.requires_grad_(False)
     encoder.eval()
@@ -824,9 +901,11 @@ def train(args: argparse.Namespace) -> None:
         contact_solimp = args.robosuite_contact_solimp
         layout_idx = args.robosuite_fixed_layout_index
         grip_log = args.gripper_action_log
+        sim_states_dir = args.sim_states_dir
         env = RobosuiteRLTEnv(
             controller_cfg=args.robosuite_controller_cfg,
             image_size=args.robosuite_image_size,
+            use_wrist_cameras=not args.robosuite_no_wrist_cameras,
             max_steps=cfg.max_episode_steps,
             seed=args.seed,
             tape_offsets_json=tape_json,
@@ -834,10 +913,12 @@ def train(args: argparse.Namespace) -> None:
             contact_solimp=contact_solimp,
             tape_layout_index=layout_idx,
             gripper_action_log=grip_log,
+            sim_states_dir=sim_states_dir,
         )
         eval_env = RobosuiteRLTEnv(
             controller_cfg=args.robosuite_controller_cfg,
             image_size=args.robosuite_image_size,
+            use_wrist_cameras=not args.robosuite_no_wrist_cameras,
             max_steps=cfg.max_episode_steps,
             seed=args.seed + 1000,
             tape_offsets_json=tape_json,
@@ -845,6 +926,7 @@ def train(args: argparse.Namespace) -> None:
             contact_solimp=contact_solimp,
             tape_layout_index=layout_idx,
             gripper_action_log=None,
+            sim_states_dir=sim_states_dir,
         )
         if args.match_ground_truth_eval_rollout and tape_json is None:
             logger.warning(

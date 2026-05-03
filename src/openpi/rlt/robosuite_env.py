@@ -16,12 +16,19 @@ Handles:
 - First ``reset()`` with tape layout index ``0`` skips a redundant inner ``reset()`` so the
   initial observation matches ``groundTruthEval`` (Franka ``__init__`` already reset with
   ``_tape_combos[0]``); later episodes always full-reset the scene.
+- Optional sim state snapshots (``sim_states_dir``): on each reset, restores a
+  pre-captured MuJoCo sim state so the episode starts from a mid-demo configuration
+  rather than the beginning of the scene. One snapshot per unique tape position,
+  created by ``misc_scripts/capture_sim_states.py``. After ``reset_from_xml_string``,
+  training-time ``contact_solref`` / ``contact_solimp`` are applied again so they
+  match ``groundTruthEval`` even though the XML was reloaded from disk.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -30,6 +37,10 @@ import cv2
 import numpy as np
 
 from openpi.rlt.env_interface import RLEnvironment
+
+# Tolerance (metres) for nearest-neighbour tape position lookup.
+# A warning is issued when the closest snapshot is farther than this.
+_SIM_STATE_MATCH_WARN_DIST = 0.005
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +140,32 @@ def _resolve_controller_cfg(controller_cfg: str) -> str:
             f"(resolved to {candidate}; robosuite package root {pkg_root})"
         )
     return str(candidate)
+
+
+_NEWER_MJCF_ATTRS = ("colorspace",)
+
+
+def _sanitize_mjcf_for_local_mujoco(xml: str) -> str:
+    """Drop MJCF attributes added by newer mujoco that older parsers reject.
+
+    Captures done with mujoco>=3.x emit ``colorspace="..."`` on ``<texture>``; mujoco<=2.x
+    raises ``Schema violation: unrecognized attribute: 'colorspace'``. We only ever
+    *replay* states from these XMLs, so dropping such attributes is safe.
+    """
+    cleaned = xml
+    dropped: dict[str, int] = {}
+    for attr in _NEWER_MJCF_ATTRS:
+        pattern = re.compile(rf'\s+{re.escape(attr)}="[^"]*"')
+        new_xml, n = pattern.subn("", cleaned)
+        if n:
+            dropped[attr] = n
+            cleaned = new_xml
+    if dropped:
+        logger.info(
+            "sim_states XML: stripped %s for local mujoco compatibility.",
+            ", ".join(f"{k}×{v}" for k, v in dropped.items()),
+        )
+    return cleaned
 
 
 def _ensure_robosuite_opencv_image_convention() -> None:
@@ -263,6 +300,7 @@ class RobosuiteRLTEnv(RLEnvironment):
         contact_solimp: list[float] | None = None,
         tape_layout_index: int | None = None,
         gripper_action_log: str | Path | None = None,
+        sim_states_dir: str | Path | None = None,
     ) -> None:
         _ensure_robosuite_opencv_image_convention()
         from robosuite.environments.custom.franka_robosuite_tape_handover import (
@@ -285,6 +323,8 @@ class RobosuiteRLTEnv(RLEnvironment):
         (yellow_x, yellow_y), (duct_x, duct_y) = self._tape_combos[0]
 
         controller_cfg = _resolve_controller_cfg(controller_cfg)
+        self._contact_solref = contact_solref
+        self._contact_solimp = contact_solimp
         self.env = FrankaRobosuiteTapeHandover(
             controller_cfg=controller_cfg,
             viser_debug=False,
@@ -296,7 +336,7 @@ class RobosuiteRLTEnv(RLEnvironment):
             yellow_tape_offset=[yellow_x, yellow_y, 0.0],
             duct_tape_offset=[duct_x, duct_y, 0.0],
         )
-        self._apply_contact_overrides(contact_solref, contact_solimp)
+        self._apply_contact_overrides(self._contact_solref, self._contact_solimp)
         self._raw_obs: dict[str, Any] = {}
         self._last_grip_cmd = np.array([1.0, 1.0], dtype=np.float64)
         self._tape_layout_index = tape_layout_index
@@ -308,6 +348,123 @@ class RobosuiteRLTEnv(RLEnvironment):
         # True until the first :meth:`reset` completes. Used to avoid a second full mujoco reset
         # when the first episode uses layout 0 — same as ``groundTruthEval`` after Franka __init__.
         self._first_reset_after_construct = True
+
+        # Sim state snapshots (optional). Loaded eagerly so missing files fail at
+        # construction time, not mid-training.
+        self._sim_states: np.ndarray | None = None      # [N, state_dim]
+        self._sim_state_positions: np.ndarray | None = None  # [N, 4] (yx, yy, dx, dy)
+        self._sim_state_xml: str | None = None
+        if sim_states_dir is not None:
+            self._load_sim_states(Path(sim_states_dir), use_wrist_cameras=use_wrist_cameras)
+
+    def _load_sim_states(self, sim_states_dir: Path, *, use_wrist_cameras: bool) -> None:
+        """Load pre-captured sim state snapshots from *sim_states_dir*.
+
+        Supports two layouts produced by ``misc_scripts/capture_sim_states.py``:
+
+        **Per-file layout** (current default):
+          index.json  -- list of {yellow_x, yellow_y, duct_x, duct_y, state_file}
+          <state_file>.npy  -- one flattened MjSimState per tape position
+          model.xml   -- MuJoCo model XML string (required for correct restore)
+
+        **Combined layout** (legacy):
+          index.json  -- list of {yellow_x, yellow_y, duct_x, duct_y, state_idx}
+          states.npz  -- 'states': [N, state_dim] array of flattened MjSimState
+          model.xml   -- MuJoCo model XML string (required)
+        """
+        index_path = sim_states_dir / "index.json"
+        xml_path = sim_states_dir / "model.xml"
+
+        if not index_path.exists():
+            raise FileNotFoundError(f"sim_states index.json not found: {index_path}")
+
+        with index_path.open() as f:
+            index = json.load(f)
+
+        if not index:
+            raise ValueError(f"sim_states index.json is empty: {index_path}")
+
+        positions = np.array(
+            [[e["yellow_x"], e["yellow_y"], e["duct_x"], e["duct_y"]] for e in index],
+            dtype=np.float64,
+        )
+
+        # Per-file layout: each entry has a 'state_file' key.
+        if "state_file" in index[0]:
+            ordered_states_list = []
+            for entry in index:
+                npy_path = sim_states_dir / entry["state_file"]
+                if not npy_path.exists():
+                    raise FileNotFoundError(f"sim_states file not found: {npy_path}")
+                ordered_states_list.append(np.load(str(npy_path)))
+            ordered_states = np.stack(ordered_states_list, axis=0)
+        else:
+            # Legacy combined layout: entries have a 'state_idx' key.
+            states_path = sim_states_dir / "states.npz"
+            if not states_path.exists():
+                raise FileNotFoundError(f"sim_states states.npz not found: {states_path}")
+            data = np.load(str(states_path))
+            states = data["states"]
+            ordered_states = np.zeros((len(index), states.shape[1]), dtype=np.float64)
+            for i, entry in enumerate(index):
+                ordered_states[i] = states[entry["state_idx"]]
+
+        self._sim_states = ordered_states
+        self._sim_state_positions = positions
+
+        if not xml_path.exists():
+            raise FileNotFoundError(
+                f"sim_states model.xml not found: {xml_path}. "
+                "Re-run misc_scripts/capture_sim_states.py (it writes model.xml on the first "
+                "successful layout). Without it, nq/nv may not match the saved .npy vectors."
+            )
+        self._sim_state_xml = _sanitize_mjcf_for_local_mujoco(
+            xml_path.read_text(encoding="utf-8")
+        )
+        xml_text = self._sim_state_xml.lower()
+        has_wrist = "robot0_eye_in_hand" in xml_text or "eye_in_hand" in xml_text
+        if use_wrist_cameras and not has_wrist:
+            logger.warning(
+                "sim_states model.xml looks like agentview-only (no wrist camera names in XML) "
+                "but RobosuiteRLTEnv has use_wrist_cameras=True. Re-capture with "
+                "misc_scripts/capture_sim_states.py without --no-wrist-cameras, or set "
+                "--robosuite_use_wrist_cameras false on Stage 2."
+            )
+        elif not use_wrist_cameras and has_wrist:
+            logger.warning(
+                "sim_states appear to include wrist cameras but use_wrist_cameras=False; "
+                "observation keys may not match what the VLA expects."
+            )
+
+        logger.info(
+            "RobosuiteRLTEnv: loaded %d sim state snapshots from %s",
+            len(index), sim_states_dir,
+        )
+
+    def _lookup_sim_state(
+        self,
+        yellow_x: float,
+        yellow_y: float,
+        duct_x: float,
+        duct_y: float,
+    ) -> np.ndarray:
+        """Return the flattened MjSimState closest to the given tape position.
+
+        Uses Euclidean distance in (yellow_x, yellow_y, duct_x, duct_y) space.
+        Warns if the nearest neighbour is farther than ``_SIM_STATE_MATCH_WARN_DIST``.
+        """
+        query = np.array([yellow_x, yellow_y, duct_x, duct_y], dtype=np.float64)
+        dists = np.linalg.norm(self._sim_state_positions - query, axis=1)
+        idx = int(np.argmin(dists))
+        dist = float(dists[idx])
+        if dist > _SIM_STATE_MATCH_WARN_DIST:
+            logger.warning(
+                "_lookup_sim_state: nearest snapshot is %.4f m away from "
+                "yellow=(%.4f, %.4f) duct=(%.4f, %.4f). "
+                "Consider adding a snapshot for this exact position.",
+                dist, yellow_x, yellow_y, duct_x, duct_y,
+            )
+        return self._sim_states[idx]
 
     def _apply_contact_overrides(
         self,
@@ -323,6 +480,24 @@ class RobosuiteRLTEnv(RLEnvironment):
             solimp = np.array(contact_solimp, dtype=np.float64)
             n = len(solimp)
             rs.sim.model.geom_solimp[:, :n] = solimp
+
+    def _sync_robots_after_sim_state(self, rs: Any) -> None:
+        """Align composite controllers with ``sim.data`` after ``set_state_from_flattened``.
+
+        ``reset_from_xml_string`` ends with ``env.reset()``, which sets controller goals from
+        the transient pose at that moment. We then overwrite *only* time/qpos/qvel via the
+        flattened snapshot, so goals still target the old configuration until this runs —
+        the arms ease toward the nominal init over the first steps (looks like "start").
+        """
+        robots = getattr(rs, "robots", None)
+        if not robots:
+            return
+        for robot in robots:
+            cc = getattr(robot, "composite_controller", None)
+            if cc is None:
+                continue
+            cc.update_state()
+            cc.reset()
 
     def _resize_image(self, image: np.ndarray) -> np.ndarray:
         """Resize image to target size using bilinear interpolation."""
@@ -414,6 +589,58 @@ class RobosuiteRLTEnv(RLEnvironment):
                     # Match ``groundTruthEval`` / Franka API (not raw ``_get_observations``).
                     self._raw_obs = self.env.get_observation()
                 self._first_reset_after_construct = False
+
+                # Restore pre-captured sim state if snapshots are configured.
+                # This overwrites the normal reset state so the episode starts from
+                # exactly the mid-demo configuration at the captured sim time.
+                if self._sim_states is not None:
+                    state_flat = np.asarray(
+                        self._lookup_sim_state(yellow_x, yellow_y, duct_x, duct_y),
+                        dtype=np.float64,
+                    ).reshape(-1)
+                    rs = self.env.robosuite_env
+                    # Match robosuite DemoSamplerWrapper: ``reset_from_xml_string`` reloads the
+                    # model and runs a full ``env.reset()`` internally. Do **not** call
+                    # ``sim.reset()`` between that and ``set_state_from_flattened`` —
+                    # ``mj_resetData`` zeros state and breaks the placement/state sequence.
+                    if self._sim_state_xml is None:
+                        raise RuntimeError("sim state XML missing (should have been required at load).")
+                    rs.reset_from_xml_string(self._sim_state_xml)
+                    expected = 1 + rs.sim.model.nq + rs.sim.model.nv
+                    if state_flat.size != expected:
+                        raise ValueError(
+                            f"Saved sim state length {state_flat.size} != 1+nq+nv={expected} "
+                            f"(nq={rs.sim.model.nq}, nv={rs.sim.model.nv}). "
+                            "Recapture with the same robosuite build (cameras, controller) as Stage 2."
+                        )
+                    if int(rs.sim.model.na) != 0:
+                        raise ValueError(
+                            f"Sim model has na={rs.sim.model.na}; flattened snapshots require na=0."
+                        )
+                    rs.sim.set_state_from_flattened(state_flat)
+                    rs.sim.forward()
+                    self._sync_robots_after_sim_state(rs)
+                    self._apply_contact_overrides(self._contact_solref, self._contact_solimp)
+                    # Robosuite caches observable values (proprio + camera RGB) at the end of
+                    # ``env.reset()``, BEFORE our ``set_state_from_flattened`` ran. Without a
+                    # forced refresh, ``get_observation`` returns the post-reset start pose and
+                    # the policy plans from there — which makes rollout videos look like the
+                    # snapshot was never applied. Force-refresh + clear stale cache.
+                    rs._obs_cache = {}  # noqa: SLF001
+                    rs._update_observables(force=True)  # noqa: SLF001
+                    self.env._step_count = 0
+                    self._raw_obs = self.env.get_observation()
+                    logger.info(
+                        "Restored sim snapshot: yellow=(%.4f,%.4f) duct=(%.4f,%.4f) "
+                        "mj_time=%.4f state_dim=%d",
+                        yellow_x,
+                        yellow_y,
+                        duct_x,
+                        duct_y,
+                        float(state_flat[0]),
+                        state_flat.size,
+                    )
+
                 out = self._format_obs(self._raw_obs)
                 st = out["state"]
                 self._last_grip_cmd = np.array([float(st[7]), float(st[15])], dtype=np.float64)
