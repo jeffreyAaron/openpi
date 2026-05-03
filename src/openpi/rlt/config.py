@@ -57,6 +57,9 @@ class Stage2Config:
     rl_chunk_length: int = 10  # C: RL policy chunk length (< VLA horizon H=50).
     action_dim: int = 16  # d: per-timestep action dim (TSH bimanual Franka = 16).
     stride: int = 2  # Subsampling stride for replay buffer.
+    # Extended VLA reference context fed to the actor. -1 keeps ref_context_length == rl_chunk_length.
+    # Larger value lets the actor "compress" a longer horizon into the chunk it outputs (article idea).
+    ref_context_length: int = -1
 
     # --- Rollout action smoothing (groundTruthEval-style; toggle with action_smoothing) ---
     # none: one VLA+actor call every rl_chunk_length steps, no overlap smoothing.
@@ -66,28 +69,34 @@ class Stage2Config:
     te_k: float = 0.1  # Temporal ensembling decay (higher = favor newest chunk less).
     ema_alpha: float = 0.75  # New-chunk weight in overlap EMA (ema_overlap mode).
 
-    # --- Actor network ---
-    actor_hidden_dim: int = 256
-    actor_num_layers: int = 2
+    # --- Actor network (article: [512,512,512]) ---
+    actor_hidden_dim: int = 512
+    actor_num_layers: int = 3
     actor_fixed_std: float = 0.03  # Exploration std when stochastic rollout / forward() sampling.
     actor_stochastic_rollout: bool = False  # If True, rollout uses mean + noise; else mean only (less jitter).
     actor_lr: float = 3e-4
 
-    # --- Critic network ---
-    critic_hidden_dim: int = 256
-    critic_num_layers: int = 2
+    # --- Critic network (article: [512,512,512], 4 critics) ---
+    critic_hidden_dim: int = 512
+    critic_num_layers: int = 3
     critic_lr: float = 3e-4
+    num_critics: int = 4  # N independent Q-heads; q_min = elementwise min across all.
 
-    # --- RL hyperparameters ---
-    discount: float = 0.99
+    # --- RL hyperparameters (article-tuned) ---
+    discount: float = 0.985  # Article uses 0.985 for 30s task @ 20Hz.
     tau: float = 0.005  # Target network soft update rate.
-    bc_reg_weight: float = 5.0  # beta: BC toward VLA reference (mean MSE); higher = tighter anchor.
+    bc_reg_weight: float = 0.05  # beta: BC toward VLA reference (arm joints); article value.
+    gripper_bc_reg_weight: float = 0.01  # Lower BC weight on gripper dims (article: safer exploration).
     ref_action_dropout: float = 0.2  # Fraction of batch with ref zeroed during actor update (generalization).
-    utd_ratio: int = 5  # Update-to-data ratio.
+    utd_ratio: int = 10  # Update-to-data ratio (article: 10 for [512,512,512]).
     critic_updates_per_actor: int = 2  # Critic updates per actor update.
+    gradient_clip: float = 20.0  # Max grad norm for actor/critic (article: halved 40->20 after Q-spike).
+    jerk_reg_weight: float = 0.01  # Weight on mean((mu[t+1]-mu[t])^2) to encourage smooth actor chunks.
 
-    # --- Replay buffer ---
-    buffer_capacity: int = 100_000
+    # --- Replay buffer (demo + online) ---
+    buffer_capacity: int = 100_000  # Online buffer capacity.
+    demo_buffer_capacity: int = 100_000  # Demo buffer capacity (warmup/prior runs).
+    demo_fraction: float = 0.5  # Fraction of each training batch drawn from the demo buffer.
     batch_size: int = 256
     # Warm-up uses the same rollout loop as post-warm-up; align chunk length + smoothing with GTE
     # via train_rlt_stage2.py --match_ground_truth_eval_rollout (see script help).
@@ -96,6 +105,8 @@ class Stage2Config:
     # --- Dimensions (derived from VLA + robot) ---
     z_rl_dim: int = 2048
     state_dim: int = 16  # Proprioceptive state dimension.
+    # Gripper dim indices for per-joint BC loss split (bimanual Panda = (7, 15)).
+    gripper_action_indices: tuple[int, ...] = (7, 15)
 
     # --- Episode settings ---
     max_episode_steps: int = 1800  # Matches Robosuite default.
@@ -103,6 +114,12 @@ class Stage2Config:
     eval_interval: int = 50  # Evaluate every N episodes.
     eval_episodes: int = 10
     save_interval: int = 100
+
+    # --- Segment gating (hand-picked [X, Y) window of env timesteps for RLT training) ---
+    # Inclusive start (X); defaults to 0 = whole episode.
+    rlt_segment_start_step: int = 0
+    # Exclusive end (Y); -1 = full episode (use max_episode_steps).
+    rlt_segment_end_step: int = -1
 
     # --- Environment ---
     control_freq: int = 20  # Robosuite: 20 Hz.
@@ -112,11 +129,25 @@ class Stage2Config:
         """Flattened action chunk dimension: C * d."""
         return self.rl_chunk_length * self.action_dim
 
+    @property
+    def ref_context_chunk_dim(self) -> int:
+        """Flattened VLA reference context dim fed to actor (>= action_chunk_dim)."""
+        ctx = self.ref_context_length if self.ref_context_length > 0 else self.rl_chunk_length
+        return ctx * self.action_dim
+
     def infer_every(self) -> int:
         """Environment steps between VLA+actor forward passes during rollout."""
         if self.action_smoothing == "none":
             return self.rl_chunk_length
         return self.inference_frequency
+
+    def segment_end_step(self) -> int:
+        """Resolved exclusive end step for the RLT segment (uses max_episode_steps when -1)."""
+        return self.rlt_segment_end_step if self.rlt_segment_end_step >= 0 else self.max_episode_steps
+
+    def is_rlt_segment_step(self, step_idx: int) -> bool:
+        """True iff ``step_idx`` (env timestep) lies in ``[X, Y)``."""
+        return self.rlt_segment_start_step <= step_idx < self.segment_end_step()
 
 
 @dataclass

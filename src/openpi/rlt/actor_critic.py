@@ -1,7 +1,8 @@
 """Lightweight actor-critic networks for Stage 2 online RL.
 
-Implements the Gaussian actor (Eq. 4-5) and TD3-style twin Q-critic (Eq. 3)
-from the RLT paper. Both are small MLPs operating on the RL token representation.
+Implements the Gaussian actor (Eq. 4-5) and an N-head Q-critic ensemble
+(article-style generalization of the paper's TD3 twin critic) from the RLT paper.
+Both are small MLPs operating on the RL token representation.
 """
 
 from __future__ import annotations
@@ -29,15 +30,19 @@ class GaussianActor(nn.Module):
 
     pi_theta(a | x, a_tilde) = N(mu_theta(x, a_tilde), sigma^2 I)
 
-    The actor takes the RL token, proprioceptive state, and a reference action
-    chunk from the VLA, and outputs a Gaussian mean over the flattened action
-    chunk. During training, reference actions are dropped out 50% of the time
-    (replaced with zeros) to prevent copying.
+    The actor takes the RL token, proprioceptive state, and a VLA reference
+    context (which may be longer than the output chunk — see
+    ``ref_context_chunk_dim`` — so the actor can "compress" a longer horizon into
+    its shorter emitted chunk, per the article's h_context > h_chunk idea).
+    The output dimension stays at ``action_chunk_dim`` (= C * d).
 
     Args:
         z_rl_dim: Dimension of the RL token z_rl.
         state_dim: Dimension of proprioceptive state s_p.
-        action_chunk_dim: Flattened action chunk dimension (C * d).
+        action_chunk_dim: Flattened OUTPUT chunk dimension (C * d).
+        ref_context_chunk_dim: Flattened VLA reference context dim fed in.
+            Defaults to ``action_chunk_dim`` (no extended context). Must be >=
+            ``action_chunk_dim`` for the "extended context" setting.
         hidden_dim: MLP hidden layer width.
         num_layers: Number of hidden layers.
         fixed_std: Fixed standard deviation for the Gaussian.
@@ -48,12 +53,22 @@ class GaussianActor(nn.Module):
         z_rl_dim: int = 2048,
         state_dim: int = 16,
         action_chunk_dim: int = 160,
+        ref_context_chunk_dim: int | None = None,
         hidden_dim: int = 256,
         num_layers: int = 2,
         fixed_std: float = 0.1,
     ) -> None:
         super().__init__()
-        input_dim = z_rl_dim + state_dim + action_chunk_dim
+        if ref_context_chunk_dim is None:
+            ref_context_chunk_dim = action_chunk_dim
+        if ref_context_chunk_dim < action_chunk_dim:
+            raise ValueError(
+                f"ref_context_chunk_dim ({ref_context_chunk_dim}) must be >= "
+                f"action_chunk_dim ({action_chunk_dim})"
+            )
+        self.action_chunk_dim = action_chunk_dim
+        self.ref_context_chunk_dim = ref_context_chunk_dim
+        input_dim = z_rl_dim + state_dim + ref_context_chunk_dim
         self.mlp = _build_mlp(input_dim, hidden_dim, action_chunk_dim, num_layers)
         self.fixed_std = fixed_std
 
@@ -65,11 +80,12 @@ class GaussianActor(nn.Module):
         Args:
             z_rl: [B, z_rl_dim] RL token.
             state: [B, state_dim] proprioceptive state.
-            ref_actions: [B, C*d] flattened VLA reference chunk (or zeros if dropped).
+            ref_actions: [B, ref_context_chunk_dim] flattened VLA reference context
+                (may be longer than the output chunk; zero-padded if shorter).
 
         Returns:
-            sampled: [B, C*d] sampled actions (mean + noise).
-            mean: [B, C*d] action mean (deterministic component).
+            sampled: [B, action_chunk_dim] sampled actions (mean + noise).
+            mean: [B, action_chunk_dim] action mean (deterministic component).
         """
         mean = self.forward_mean(z_rl, state, ref_actions)
         noise = torch.randn_like(mean) * self.fixed_std
@@ -81,11 +97,13 @@ class GaussianActor(nn.Module):
         return self.mlp(x)
 
 
-class TwinQCritic(nn.Module):
-    """TD3-style twin Q-function for action-chunk evaluation.
+class MultiQCritic(nn.Module):
+    """Ensemble of ``num_critics`` independent Q-networks for action-chunk evaluation.
 
-    Two independent Q-networks that estimate Q(x, a_1:C) where x = (z_rl, s_p).
-    Uses the minimum of both for target computation to reduce overestimation.
+    Generalizes the paper's TD3-style twin critic. The article uses 4 heads
+    (doubled from 2) alongside gradient clipping to reduce reward-hacking Q-spikes.
+    ``q_min`` returns the elementwise minimum across all heads for conservative
+    target bootstrapping, and ``forward`` returns the full list for per-head MSE.
 
     Args:
         z_rl_dim: Dimension of the RL token z_rl.
@@ -93,6 +111,7 @@ class TwinQCritic(nn.Module):
         action_chunk_dim: Flattened action chunk dimension (C * d).
         hidden_dim: MLP hidden layer width.
         num_layers: Number of hidden layers.
+        num_critics: Number of independent Q-heads (article uses 4).
     """
 
     def __init__(
@@ -102,16 +121,19 @@ class TwinQCritic(nn.Module):
         action_chunk_dim: int = 160,
         hidden_dim: int = 256,
         num_layers: int = 2,
+        num_critics: int = 4,
     ) -> None:
         super().__init__()
+        if num_critics < 2:
+            raise ValueError(f"num_critics must be >= 2, got {num_critics}")
+        self.num_critics = num_critics
         input_dim = z_rl_dim + state_dim + action_chunk_dim
-        self.q1 = _build_mlp(input_dim, hidden_dim, 1, num_layers)
-        self.q2 = _build_mlp(input_dim, hidden_dim, 1, num_layers)
+        self.qs = nn.ModuleList(
+            [_build_mlp(input_dim, hidden_dim, 1, num_layers) for _ in range(num_critics)]
+        )
 
-    def forward(
-        self, z_rl: Tensor, state: Tensor, actions: Tensor
-    ) -> tuple[Tensor, Tensor]:
-        """Compute both Q-values.
+    def forward(self, z_rl: Tensor, state: Tensor, actions: Tensor) -> list[Tensor]:
+        """Compute all Q-values.
 
         Args:
             z_rl: [B, z_rl_dim] RL token.
@@ -119,23 +141,24 @@ class TwinQCritic(nn.Module):
             actions: [B, C*d] flattened action chunk.
 
         Returns:
-            q1: [B] Q-value from first network.
-            q2: [B] Q-value from second network.
+            List of ``num_critics`` tensors of shape [B], one per head.
         """
         x = torch.cat([z_rl, state, actions], dim=-1)
-        return self.q1(x).squeeze(-1), self.q2(x).squeeze(-1)
+        return [q(x).squeeze(-1) for q in self.qs]
 
     def q_min(self, z_rl: Tensor, state: Tensor, actions: Tensor) -> Tensor:
-        """Compute min(Q1, Q2) for conservative target estimates.
-
-        Returns:
-            q_min: [B] element-wise minimum of both Q-values.
-        """
-        q1, q2 = self.forward(z_rl, state, actions)
-        return torch.min(q1, q2)
+        """Elementwise min over all heads (conservative target estimate)."""
+        qs = self.forward(z_rl, state, actions)
+        stacked = torch.stack(qs, dim=0)  # [num_critics, B]
+        return stacked.min(dim=0).values  # [B]
 
 
-def create_target_critic(critic: TwinQCritic) -> TwinQCritic:
+# Backwards-compat alias. Older checkpoints / call sites expect ``TwinQCritic`` with
+# ``.q1`` / ``.q2`` attributes, but new code should use ``MultiQCritic`` directly.
+TwinQCritic = MultiQCritic
+
+
+def create_target_critic(critic: MultiQCritic) -> MultiQCritic:
     """Create a target critic as a frozen deep copy."""
     target = copy.deepcopy(critic)
     for p in target.parameters():
