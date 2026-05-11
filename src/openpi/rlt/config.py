@@ -72,6 +72,13 @@ class Stage2Config:
     actor_fixed_std: float = 0.03  # Exploration std when stochastic rollout / forward() sampling.
     actor_stochastic_rollout: bool = False  # If True, rollout uses mean + noise; else mean only (less jitter).
     actor_lr: float = 3e-4
+    # Maximum per-element residual the actor may add on top of the VLA reference.
+    # The actor mean is parametrized as `mu = ref + delta_max * tanh(mlp(...))`,
+    # which puts a hard ||mu - ref||_inf <= delta_max bound on outputs and
+    # prevents the deadly-triad blowup an unbounded MLP can drive (see
+    # GaussianActor docstring). 1.0 lets the gripper flip ±1 from VLA and arm
+    # joints deviate up to ~57deg/step from VLA in radians.
+    actor_delta_max: float = 1.0
 
     # --- Critic network ---
     critic_hidden_dim: int = 256
@@ -85,10 +92,39 @@ class Stage2Config:
     ref_action_dropout: float = 0.2  # Fraction of batch with ref zeroed during actor update (generalization).
     utd_ratio: int = 5  # Update-to-data ratio.
     critic_updates_per_actor: int = 2  # Critic updates per actor update.
+    # TD3 target-policy smoothing (Fujimoto et al. 2018): clipped Gaussian noise
+    # added to the actor's next-state mean before evaluating the target critic.
+    # Smooths the target Q surface so the actor cannot exploit a single sharp
+    # peak. Set ``target_noise_std=0`` to disable. Recommended ratios scale with
+    # ``actor_delta_max`` (defaults are 0.2 * 1.0 and 0.5 * 1.0).
+    target_noise_std: float = 0.2
+    target_noise_clip: float = 0.5
+    # Max-norm clip applied to actor and critic gradients before optimizer.step.
+    # 0 disables clipping. Recommended: 1.0.
+    grad_clip_norm: float = 1.0
 
     # --- Replay buffer ---
     buffer_capacity: int = 100_000
     batch_size: int = 256
+    # If True, during warm-up only, append rollout data only when the episode ends
+    # in task success. After warm-up, all episodes are added regardless. The filter
+    # is restricted to warm-up so the actor sees genuine on-policy failures (and
+    # learns from them) once it starts training.
+    replay_only_successful_episodes: bool = True
+
+    # --- Tape-handover-specific early termination / control hand-back ---
+    # End the episode early if the tape was lifted (phase_max >= PHASE_GRASP0=1) and
+    # then reads as back on the table (phase_now < PHASE_GRASP0). Requires shaped
+    # reward so phases exist; see ``tape_drop_episode_should_end`` in shaped_reward.py
+    # for mode-specific rules (lift_handover disables this after handover;
+    # sticky modes debounce after phase_max>=PHASE_GRASP1).
+    end_on_tape_drop: bool = True
+    # After the tape is handed to arm1 (phase_max >= PHASE_GRASP1=3), force the
+    # frozen VLA to drive the rest of the episode regardless of phase_mode /
+    # actor_task_phases. This guarantees the actor only acts during the
+    # contact-rich lift+handoff window where it has a real advantage. Requires
+    # shaped reward to be enabled; no-op otherwise.
+    end_actor_after_handover: bool = True
     # Warm-up uses the same rollout loop as post-warm-up; align chunk length + smoothing with GTE
     # via train_rlt_stage2.py --match_ground_truth_eval_rollout (see script help).
     warmup_episodes: int = 20  # Episodes of VLA-only rollouts before RL starts.
@@ -104,8 +140,41 @@ class Stage2Config:
     eval_episodes: int = 10
     save_interval: int = 100
 
+    # --- Phased control (VLA -> RLT actor -> VLA) ---
+    # "off"        : actor drives the whole post-warmup episode (current default).
+    # "chunk"      : VLA drives [0, vla_phase_end_step) and [rl_phase_end_step, max_steps);
+    #                actor drives [vla_phase_end_step, rl_phase_end_step). Time-based.
+    # "task_phase" : actor drives chunks where the current ``phase_max`` (from the
+    #                shaped-reward tracker, including ``lift_only`` mode) is in
+    #                ``actor_task_phases``; VLA drives the rest. Phase-state-based.
+    # All modes snap swaps to chunk boundaries (resolution = infer_every()).
+    phase_mode: str = "off"
+    vla_phase_end_step: int = 0  # x: VLA -> actor swap step (chunk mode only)
+    rl_phase_end_step: int = -1  # y: actor -> VLA swap step (chunk mode only; -1 = max_steps)
+    # Phase-state gate (task_phase mode): RLT actor drives whenever ``phase_max`` is
+    # in this set at a chunk-inference boundary. With ``shaped_reward_mode=lift_only``
+    # the natural setting is ``[1]`` (RLT runs once the tape is off the table).
+    actor_task_phases: tuple[int, ...] = (1,)
+    # Replay buffer policy when phase_mode != "off":
+    #   "rl_window_only": only insert transitions in [x, y); force done=1.0 at the boundary so the
+    #                     critic does not bootstrap into VLA-controlled future states.
+    #   "all": insert every transition (outside the window the executed action is VLA, so the BC
+    #          term will pull the actor toward VLA there as well).
+    phase_replay_strategy: str = "rl_window_only"
+    # Reset the action smoothing runtime at each phase boundary so VLA and actor chunks aren't
+    # blended together at the seam.
+    phase_reset_smoothing: bool = True
+
     # --- Environment ---
     control_freq: int = 20  # Robosuite: 20 Hz.
+
+    # --- Shaped reward (Robosuite tape-handover only) ---
+    # "off"          : sparse 1.0 on success, 0.0 elsewhere (legacy default).
+    # "sticky"       : pure step-function phase progress — only the milestone
+    #                  bonus on each new phase + sparse success terminal.
+    # "dense_sticky" : sticky + Ng-1999 potential-difference shaping inside
+    #                  each phase. See openpi.rlt.shaped_reward.
+    shaped_reward_mode: str = "off"
 
     @property
     def action_chunk_dim(self) -> int:

@@ -18,6 +18,8 @@ from typing import Any
 
 import numpy as np
 
+from openpi.rlt.shaped_reward import ShapedRewardConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,6 +46,9 @@ class RobosuiteWorkerSpec:
     tape_layout_index: int | None
     gripper_action_log: str | None
     z_rl_dim: int
+    # Shaped reward config carried as a plain dict for picklability across the
+    # multiprocessing boundary; ``None`` keeps the legacy sparse 0/1 reward.
+    shaped_reward_cfg: dict | None = None
 
 
 def _action_queue_get(action_queue: Queue, stop_flag: Event, *, timeout: float = 0.5) -> dict[str, Any] | None:
@@ -83,6 +88,11 @@ def robosuite_rlt_rollout_worker(
     os.environ["MUJOCO_EGL_DEVICE_ID"] = str(gpu_id)
     os.environ["EGL_DEVICE_ID"] = str(gpu_id)
 
+    shaped_cfg = (
+        ShapedRewardConfig(**spec.shaped_reward_cfg)
+        if spec.shaped_reward_cfg is not None
+        else None
+    )
     env = RobosuiteRLTEnv(
         controller_cfg=spec.controller_cfg,
         image_size=spec.image_size,
@@ -93,6 +103,7 @@ def robosuite_rlt_rollout_worker(
         contact_solimp=spec.contact_solimp,
         tape_layout_index=spec.tape_layout_index,
         gripper_action_log=spec.gripper_action_log if env_id == 0 else None,
+        shaped_reward_cfg=shaped_cfg,
     )
 
     C, d = rl_chunk_length, action_dim
@@ -149,7 +160,7 @@ def robosuite_rlt_rollout_worker(
             a_exec = smooth.next_executable_action(action_chunk, step_in_cycle)
             ref_row = np.asarray(ref_chunk_np[step_in_cycle], dtype=np.float32).reshape(-1)
 
-            obs_dict, reward, done, _info = env.step(a_exec)
+            obs_dict, reward, done, info = env.step(a_exec)
             ep_reward += float(reward)
             ep_steps += 1
 
@@ -166,6 +177,12 @@ def robosuite_rlt_rollout_worker(
                     "ep_reward": ep_reward,
                     "ep_steps": ep_steps,
                     "success": bool(env.task_completed()) if done else False,
+                    # Phase fields are always present (zeros when shaping is off);
+                    # downstream consumers can read them unconditionally.
+                    "phase": int(info.get("phase", 0)),
+                    "phase_max": int(info.get("phase_max", 0)),
+                    "shaping_reward": float(info.get("shaping_reward", 0.0)),
+                    "milestone_reward": float(info.get("milestone_reward", 0.0)),
                     "video_frames": list(video_frames) if (done and env_id == 0) else None,
                 }
             )

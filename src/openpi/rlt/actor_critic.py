@@ -25,14 +25,30 @@ def _build_mlp(input_dim: int, hidden_dim: int, output_dim: int, num_layers: int
 
 
 class GaussianActor(nn.Module):
-    """Gaussian policy that refines VLA reference action chunks.
+    """Gaussian residual policy that refines VLA reference action chunks.
 
     pi_theta(a | x, a_tilde) = N(mu_theta(x, a_tilde), sigma^2 I)
 
     The actor takes the RL token, proprioceptive state, and a reference action
     chunk from the VLA, and outputs a Gaussian mean over the flattened action
-    chunk. During training, reference actions are dropped out 50% of the time
-    (replaced with zeros) to prevent copying.
+    chunk. The mean is parametrized as a bounded residual on top of the VLA
+    reference:
+
+        mu = a_tilde_base + delta_max * tanh(mlp([z_rl, s_p, a_tilde_in]))
+
+    where ``a_tilde_base`` is always the unmasked VLA reference and
+    ``a_tilde_in`` is the (possibly dropout-zeroed) reference fed to the MLP
+    during training. The residual + tanh enforces ``||mu - a_tilde_base||_inf
+    <= delta_max`` per element, which prevents the deadly-triad blowup TD3-style
+    actor-critic learning is prone to: an unbounded MLP output lets the actor
+    chase ever-larger Q-values out of distribution, the critic chases targets
+    computed at those out-of-distribution actions, and both diverge together.
+
+    During training, the reference fed to the MLP can be dropped out (replaced
+    with zeros) for ``ref_action_dropout`` of the batch to encourage the policy
+    to use ``z_rl`` and ``s_p`` rather than copying ``a_tilde``. The residual
+    base passed via ``ref_for_residual`` is always the true VLA reference so
+    the bound stays meaningful.
 
     Args:
         z_rl_dim: Dimension of the RL token z_rl.
@@ -41,6 +57,10 @@ class GaussianActor(nn.Module):
         hidden_dim: MLP hidden layer width.
         num_layers: Number of hidden layers.
         fixed_std: Fixed standard deviation for the Gaussian.
+        delta_max: Maximum per-element residual magnitude. With absolute joint
+            position actions in radians and gripper dims in [-1, 1], 1.0 lets
+            the actor flip the gripper fully while keeping arm joint deviations
+            within ~57deg/step from the VLA target.
     """
 
     def __init__(
@@ -51,34 +71,55 @@ class GaussianActor(nn.Module):
         hidden_dim: int = 256,
         num_layers: int = 2,
         fixed_std: float = 0.1,
+        delta_max: float = 1.0,
     ) -> None:
         super().__init__()
         input_dim = z_rl_dim + state_dim + action_chunk_dim
         self.mlp = _build_mlp(input_dim, hidden_dim, action_chunk_dim, num_layers)
         self.fixed_std = fixed_std
+        self.delta_max = float(delta_max)
 
     def forward(
-        self, z_rl: Tensor, state: Tensor, ref_actions: Tensor
+        self,
+        z_rl: Tensor,
+        state: Tensor,
+        ref_actions: Tensor,
+        ref_for_residual: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Compute action mean and sample.
 
         Args:
             z_rl: [B, z_rl_dim] RL token.
             state: [B, state_dim] proprioceptive state.
-            ref_actions: [B, C*d] flattened VLA reference chunk (or zeros if dropped).
+            ref_actions: [B, C*d] flattened VLA reference chunk fed to the MLP.
+                May be dropout-zeroed during actor updates.
+            ref_for_residual: [B, C*d] base for the residual. Defaults to
+                ``ref_actions`` when ``None`` (correct for rollout / TD-target
+                paths where no dropout is applied).
 
         Returns:
             sampled: [B, C*d] sampled actions (mean + noise).
             mean: [B, C*d] action mean (deterministic component).
         """
-        mean = self.forward_mean(z_rl, state, ref_actions)
+        mean = self.forward_mean(z_rl, state, ref_actions, ref_for_residual)
         noise = torch.randn_like(mean) * self.fixed_std
         return mean + noise, mean
 
-    def forward_mean(self, z_rl: Tensor, state: Tensor, ref_actions: Tensor) -> Tensor:
-        """Deterministic action mean μ(x, a_ref) without exploration noise."""
+    def forward_mean(
+        self,
+        z_rl: Tensor,
+        state: Tensor,
+        ref_actions: Tensor,
+        ref_for_residual: Tensor | None = None,
+    ) -> Tensor:
+        """Deterministic action mean μ(x, a_ref) without exploration noise.
+
+        See class docstring for the residual / tanh parametrization.
+        """
         x = torch.cat([z_rl, state, ref_actions], dim=-1)
-        return self.mlp(x)
+        delta = self.delta_max * torch.tanh(self.mlp(x))
+        base = ref_actions if ref_for_residual is None else ref_for_residual
+        return base + delta
 
 
 class TwinQCritic(nn.Module):
