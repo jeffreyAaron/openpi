@@ -3,9 +3,15 @@
 This script is used to compute the normalization statistics for a given config. It
 will compute the mean and standard deviation of the data in the dataset and save it
 to the config assets directory.
+
+LeRobot video decoding: by default we set ``OPENPI_LEROBOT_VIDEO_BACKEND=pyav`` so this
+script does not depend on TorchCodec + system FFmpeg (which often fails with
+``libtorchcodec`` / ``libavutil.so`` errors). Pass ``--lerobot-video-default`` to use
+LeRobot's default backend instead.
 """
 
 import dataclasses
+import os
 import pathlib
 
 import numpy as np
@@ -93,7 +99,13 @@ def main(
     config_name: str,
     max_frames: int | None = None,
     lerobot_repo_id: str | None = None,
+    lerobot_video_default: bool = False,
 ):
+    if lerobot_video_default:
+        os.environ.pop("OPENPI_LEROBOT_VIDEO_BACKEND", None)
+    else:
+        os.environ.setdefault("OPENPI_LEROBOT_VIDEO_BACKEND", "pyav")
+
     config = _config.get_config(config_name)
     if lerobot_repo_id is not None:
         repo = str(pathlib.Path(lerobot_repo_id).expanduser().resolve())

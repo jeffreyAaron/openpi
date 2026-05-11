@@ -1797,9 +1797,13 @@ def train(args: argparse.Namespace) -> None:
         tape_drop_streak = 0
         ep_tape_drop_triggered = False
 
-        # Per-step "did the actor drive this step?" flag, recorded so the replay
-        # trim logic for task_phase mode knows which transitions were actor-controlled.
+        # Per-step "did the actor drive this step?" flag for diagnostics.
         ep_actor_drove: list[bool] = []
+        # Per-step "is this step inside the RL training window?" flag used by
+        # phase_replay_strategy=rl_window_only. This is computed from the phase/window
+        # gate with warm-up/VLA overrides disabled so successful warm-up episodes can
+        # still seed replay over the same state distribution the actor will control.
+        ep_in_replay_window: list[bool] = []
 
         # PyRoki handover oracle: at most one macro firing per episode. If the
         # macro raises HandoverPickerMismatchError (arm0-led pick) or
@@ -2040,6 +2044,17 @@ def train(args: argparse.Namespace) -> None:
             step_in_cycle = ep_steps % infer_every
             state = obs_dict["state"]
             a_exec = smooth.next_executable_action(action_chunk, step_in_cycle)
+            in_replay_window_now = _phase_use_actor(
+                ep_steps,
+                phase_mode=cfg.phase_mode,
+                x=phase_x,
+                y=phase_y,
+                is_warmup=False,
+                vla_only=False,
+                phase_max=current_phase_max,
+                actor_task_phases=cfg.actor_task_phases,
+                end_actor_after_handover=cfg.end_actor_after_handover,
+            )
 
             ep_z_rls.append(z_rl_np)
             ep_states.append(state.copy())
@@ -2067,6 +2082,7 @@ def train(args: argparse.Namespace) -> None:
             ep_shaping_sum += float(info.get("shaping_reward", 0.0))
             ep_milestone_sum += float(info.get("milestone_reward", 0.0))
             ep_actor_drove.append(bool(prev_use_actor))
+            ep_in_replay_window.append(bool(in_replay_window_now))
             if prev_use_actor:
                 ep_actor_steps += 1
 
@@ -2111,22 +2127,31 @@ def train(args: argparse.Namespace) -> None:
                     ),
                 )
                 last_video_phase_max = current_phase_max
+        # Replay diagnostics (before trim): confirm buffer fill + RL window length in wandb.
+        replay_ep_timesteps_pre_trim = len(ep_z_rls)
+        replay_gated_step_count = int(sum(ep_in_replay_window)) if ep_in_replay_window else 0
+        replay_phase_trim_active = (
+            cfg.phase_mode != "off" and cfg.phase_replay_strategy == "rl_window_only"
+        )
+        replay_rl_window_span = 0
+        replay_window_sliced_ok = False
         # Optionally restrict the replay buffer to the RL window so the actor's seed and gradient
         # data both cover exactly the state distribution it will eventually control. Applies to
         # warm-up episodes too: the executed actions are VLA, but we only keep the actor-window slice.
-        if cfg.phase_mode != "off" and cfg.phase_replay_strategy == "rl_window_only":
+        if replay_phase_trim_active:
             if cfg.phase_mode == "task_phase":
-                # Window is the contiguous run of actor-driven steps. ``phase_max`` is monotone
-                # in an episode, so ep_actor_drove is at most (False*, True*, False*); find the
-                # first/last True and trim to that span.
-                actor_idx = [i for i, drove in enumerate(ep_actor_drove) if drove]
-                if actor_idx:
-                    lo, hi = actor_idx[0], actor_idx[-1] + 1
+                # Window is the contiguous run where the phase gate says "actor should
+                # control" *without* warm-up/vla_only overrides. ``phase_max`` is monotone
+                # in an episode, so this mask is at most (False*, True*, False*).
+                replay_idx = [i for i, inside in enumerate(ep_in_replay_window) if inside]
+                if replay_idx:
+                    lo, hi = replay_idx[0], replay_idx[-1] + 1
                 else:
                     lo, hi = 0, 0
             else:
                 lo = max(0, phase_x)
                 hi = min(len(ep_z_rls), phase_y)
+            replay_rl_window_span = hi - lo
             if hi - lo >= cfg.rl_chunk_length:
                 ep_z_rls = ep_z_rls[lo:hi]
                 ep_states = ep_states[lo:hi]
@@ -2138,10 +2163,14 @@ def train(args: argparse.Namespace) -> None:
                 # VLA-controlled future. Episode-natural termination inside the window already
                 # has done=True, so this is a no-op there.
                 ep_dones[-1] = True
+                replay_window_sliced_ok = True
             else:
                 # Window too short for a full chunk; skip insertion (warned at startup).
                 ep_z_rls = []
+        else:
+            replay_rl_window_span = replay_ep_timesteps_pre_trim
 
+        replay_ep_timesteps_post_trim = len(ep_z_rls)
         ep_success = bool(env.task_completed())
         ep_tape_dropped = ep_tape_drop_triggered
         replay_eligible = len(ep_z_rls) >= cfg.rl_chunk_length
@@ -2158,8 +2187,9 @@ def train(args: argparse.Namespace) -> None:
         insert_replay = replay_eligible and (
             not warmup_success_filter_active or ep_success
         ) and not pyroki_suppress_replay
+        replay_chunks_added_ep = 0
         if insert_replay:
-            replay_buffer.add_chunk_with_subsampling(
+            replay_chunks_added_ep = replay_buffer.add_chunk_with_subsampling(
                 z_rls=np.array(ep_z_rls),
                 states=np.array(ep_states),
                 actions=np.array(ep_actions),
@@ -2231,6 +2261,17 @@ def train(args: argparse.Namespace) -> None:
             "train/ep_reward": ep_reward,
             "train/ep_steps": ep_steps,
             "train/buffer_size": replay_buffer.size,
+            "train/replay_capacity_frac": float(replay_buffer.size)
+            / float(max(1, cfg.buffer_capacity)),
+            "replay/chunks_added_episode": float(replay_chunks_added_ep),
+            "replay/inserted": float(insert_replay),
+            "replay/eligible": float(replay_eligible),
+            "replay/ep_timesteps_pre_trim": float(replay_ep_timesteps_pre_trim),
+            "replay/ep_timesteps_post_trim": float(replay_ep_timesteps_post_trim),
+            "replay/rl_window_span": float(replay_rl_window_span),
+            "replay/window_sliced_ok": float(replay_window_sliced_ok),
+            "replay/phase_trim_active": float(replay_phase_trim_active),
+            "replay/gated_step_count": float(replay_gated_step_count),
             "train/total_env_steps": total_env_steps,
             "train/post_warmup_env_steps": post_warmup_env_steps,
             "train/total_updates": total_updates,
@@ -2269,6 +2310,7 @@ def train(args: argparse.Namespace) -> None:
             "phase": phase,
             "rew": f"{ep_reward:.1f}",
             "buf": replay_buffer.size,
+            "+r": replay_chunks_added_ep,
             "ok": int(env.task_completed()),
         }
         if critic_losses:
@@ -2278,11 +2320,15 @@ def train(args: argparse.Namespace) -> None:
         pbar.set_postfix(pbar_postfix)
 
         # Log episode info.
+        _win = str(replay_rl_window_span) if replay_phase_trim_active else "n/a"
         logger.info(
             f"Episode {episode} | reward={ep_reward:.2f} | steps={ep_steps} | "
-            f"buffer={replay_buffer.size} | {phase} | "
-            f"success={env.task_completed()} | "
-            f"phase_max={ep_phase_max} | actor_steps={ep_actor_steps}/{ep_steps}"
+            f"buffer={replay_buffer.size}/{cfg.buffer_capacity} (+{replay_chunks_added_ep} chunks) | "
+            f"{phase} | success={env.task_completed()} | "
+            f"phase_max={ep_phase_max} | actor_steps={ep_actor_steps}/{ep_steps} | "
+            f"replay_timesteps pre/trim_span/post={replay_ep_timesteps_pre_trim}/{_win}/"
+            f"{replay_ep_timesteps_post_trim} gated_steps={replay_gated_step_count} "
+            f"insert={insert_replay}"
         )
 
         # --- Rollout video + action comparison ---
