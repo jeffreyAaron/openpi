@@ -380,14 +380,6 @@ class RobosuiteRLTEnv(RLEnvironment):
         self._table_top_z: float = 0.0
         self._refresh_sim_handles()
 
-        # PyRoki handover oracle issues thousands of inner ``robosuite_env.step`` calls per
-        # macro; default horizon (often 1000) would set ``done`` mid-macro and the next
-        # step raises ``ValueError: executing action in terminated episode``.  We relax
-        # horizon checks during / after a macro and restore the original ``ignore_done``
-        # at the start of each :meth:`reset`.
-        self._pyroki_relax_robosuite_horizon = False
-        self._pyroki_saved_ignore_done: bool | None = None
-
     def _load_sim_states(self, sim_states_dir: Path, *, use_wrist_cameras: bool) -> None:
         """Load pre-captured sim state snapshots from *sim_states_dir*.
 
@@ -615,12 +607,6 @@ class RobosuiteRLTEnv(RLEnvironment):
         # must not leak between episodes).
         self._phase_state = PhaseTrackerState()
 
-        rs = self.env.robosuite_env
-        if self._pyroki_relax_robosuite_horizon and self._pyroki_saved_ignore_done is not None:
-            rs.ignore_done = self._pyroki_saved_ignore_done
-            self._pyroki_relax_robosuite_horizon = False
-            self._pyroki_saved_ignore_done = None
-
         last_exc: Exception | None = None
         for attempt in range(_RESET_MAX_ATTEMPTS):
             if self._tape_layout_index is not None:
@@ -782,130 +768,3 @@ class RobosuiteRLTEnv(RLEnvironment):
     def task_completed(self) -> bool:
         """Check if the task has been successfully completed."""
         return self.env.task_completed()
-
-    # ------------------------------------------------------------------
-    # PyRoki oracle macro entry point (used by --handover_controller pyroki).
-    # ------------------------------------------------------------------
-    def run_pyroki_handover_macro(
-        self,
-        oracle: Any | None = None,
-        *,
-        oracle_kwargs: dict[str, Any] | None = None,
-        check_picker_arm: bool = True,
-    ) -> dict[str, Any]:
-        """Run the blocking PyRoki handover macro on the wrapped env.
-
-        The macro is implemented in :mod:`openpi.rlt.pyroki_handover` and
-        consumes many inner ``robosuite_env.step`` calls in one logical
-        rollout step. After it returns we rebuild the observation, recompute
-        shaped reward / success exactly as :meth:`step` would, and report
-        back the number of inner sim steps so the rollout loop can advance
-        its own ``ep_steps`` counter accordingly.
-
-        Args:
-            oracle: Pre-built :class:`PyrokiHandoverOracle`. If ``None``, one
-                is constructed on the wrapped env using ``oracle_kwargs``
-                and cached on the wrapper for subsequent calls.
-            oracle_kwargs: Forwarded to ``PyrokiHandoverOracle.__init__`` on
-                lazy construction.  Ignored when ``oracle`` is supplied.
-            check_picker_arm: When True (default), call
-                :meth:`PyrokiHandoverOracle.assert_arm1_holds_tape` first so an
-                arm0-led pick raises :class:`HandoverPickerMismatchError`
-                BEFORE any IK runs (lets the caller fall back to RLT/VLA).
-
-        Returns:
-            Dict with:
-                - ``obs``: formatted observation (same shape as :meth:`step`).
-                - ``reward``: shaped reward at the final post-macro state
-                  (single scalar; per-inner-step shaping is collapsed since
-                  the actor isn't training during the macro).
-                - ``done``: ``True`` iff success or the env's max_steps
-                  budget has been hit by the macro.
-                - ``info``: shaped-reward info dict (same fields as
-                  :meth:`step`'s info), augmented with macro diagnostics:
-                  ``inner_steps`` (int), ``oracle_succeeded`` (bool),
-                  ``oracle_skipped_reason`` (str | None).
-                - ``inner_steps``: same value as ``info['inner_steps']``,
-                  hoisted to the top level for ergonomic access by the
-                  rollout loop.
-        """
-        from openpi.rlt.pyroki_handover import PyrokiHandoverOracle
-
-        if oracle is None:
-            cached = getattr(self, "_pyroki_oracle", None)
-            if cached is None:
-                cached = PyrokiHandoverOracle(self.env, **(oracle_kwargs or {}))
-                self._pyroki_oracle = cached  # noqa: SLF001 — internal cache
-            oracle = cached
-
-        if check_picker_arm:
-            # Raises HandoverPickerMismatchError on arm0-led picks; the caller
-            # is responsible for catching + logging + falling back.
-            oracle.assert_arm1_holds_tape()
-
-        rs = self.env.robosuite_env
-        if not self._pyroki_relax_robosuite_horizon:
-            self._pyroki_saved_ignore_done = bool(rs.ignore_done)
-            self._pyroki_relax_robosuite_horizon = True
-        rs.ignore_done = True
-        # If a previous crash left ``done`` set, unblock the oracle's first step.
-        rs.done = False
-
-        result = oracle.run()
-        inner_steps = int(result.inner_steps)
-
-        self._raw_obs = self.env.get_observation()
-        obs = self._format_obs(self._raw_obs)
-
-        success = self.task_completed()
-        if self._shaped_cfg is not None:
-            reward, shaped_info = compute_shaped_reward(
-                raw_obs=self._raw_obs,
-                sim=self.env.robosuite_env.sim,
-                body_ids=self._body_ids,
-                site_ids=self._site_ids,
-                table_top_z=self._table_top_z,
-                success=success,
-                state=self._phase_state,
-                cfg=self._shaped_cfg,
-            )
-            info: dict[str, Any] = {"success": success, **shaped_info}
-        else:
-            reward = 1.0 if success else 0.0
-            info = {
-                "success": success,
-                "phase": 0,
-                "phase_max": 0,
-                "shaping_reward": 0.0,
-                "milestone_reward": 0.0,
-                "success_reward": float(reward),
-                "phi_now": 0.0,
-            }
-
-        # Bump the wrapper-level step counter by however many inner sim
-        # steps the macro consumed so the env's own max_steps budget stays
-        # aligned with the caller's ep_steps tracking.
-        self.env._step_count += inner_steps  # noqa: SLF001
-        done = (
-            success
-            or self.env._step_count >= self.env.max_steps
-            or result.skipped_reason == "sim_step_budget_exhausted"
-        )
-
-        info["inner_steps"] = inner_steps
-        info["oracle_succeeded"] = bool(result.succeeded)
-        info["oracle_skipped_reason"] = result.skipped_reason
-
-        # Keep gripper-zero-hold state consistent with whatever the oracle
-        # left the fingers at, so any subsequent VLA-driven steps don't
-        # inherit a stale "hold" command.
-        st = obs["state"]
-        self._last_grip_cmd = np.array([float(st[7]), float(st[15])], dtype=np.float64)
-
-        return {
-            "obs": obs,
-            "reward": float(reward),
-            "done": bool(done),
-            "info": info,
-            "inner_steps": inner_steps,
-        }
