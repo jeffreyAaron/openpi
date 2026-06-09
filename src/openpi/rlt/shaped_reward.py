@@ -22,7 +22,8 @@ Modes:
     step the yellow tape is lifted, we record ``first_grasp_arm`` ∈ {0, 1} as the
     arm whose gripper is closed alone; if both are closed that timestep we break
     ties with the eef **closer to the yellow tape**. Phase taxonomy is
-    ``{0=on table, 1=lifted (pre-handoff), 3=lifted + *that* arm fully open, 4=success}``
+    ``{0=on table, 1=lifted (pre-handoff), 3=lifted + *that* arm fully open +
+    the receiving arm grasping, 4=success}``
     — phase ``2`` is skipped so ``milestone_bonus·Δphase_max`` still pays two
     steps on 1→3 and ``end_actor_after_handover`` (``phase_max >= 3``) is unchanged.
     Phase 3 means the **original holder** opened (not the idle arm that stayed
@@ -189,6 +190,19 @@ class ShapedRewardConfig:
     handoff_y_thresh: float = 0.10      # |yellow_y - midline_y|.
     midline_y: float = 0.0              # Y where the handoff is "between" the arms.
     retreat_dist: float = 0.15          # Phase-3 target: arm0 at least this far from yellow.
+
+    # --- ``lift_handover`` optional anti-shortcut (discourage throwing / sliding to goal) ---
+    # When ``lift_handover_shortcut_xy_thresh_m > 0`` and ``lift_handover_shortcut_penalty_per_step
+    # != 0``, add that penalty each step while: tape is lifted, ``phase_max < PHASE_GRASP1`` (true
+    # handover not completed), and yellow↔duct **xy** distance is below the threshold. Set the
+    # penalty negative (e.g. -2e-3). Disabled when thresh is 0.
+    lift_handover_shortcut_xy_thresh_m: float = 0.0
+    lift_handover_shortcut_penalty_per_step: float = 0.0
+    # If True: when the env reports ``success`` but ``phase_max`` never reached ``PHASE_GRASP1``
+    # before the success step (shortcut / throw), scale ``success_bonus`` by
+    # ``lift_handover_shortcut_success_bonus_frac`` instead of paying the full bonus.
+    lift_handover_gate_success_bonus: bool = False
+    lift_handover_shortcut_success_bonus_frac: float = 0.0  # e.g. 0.15; 0.0 = no success bonus on shortcut
 
     # Tanh sharpness for distance potentials. Higher = steeper gradient near 0.
     tanh_k: float = 10.0
@@ -366,6 +380,7 @@ def compute_shaped_reward(
     site_ids: dict[str, int],
     table_top_z: float,
     success: bool,
+    base_success: bool = False,
     state: PhaseTrackerState,
     cfg: ShapedRewardConfig,
 ) -> tuple[float, dict[str, Any]]:
@@ -375,6 +390,9 @@ def compute_shaped_reward(
     ``steps_at_phase``. Returns ``(reward, info)`` where ``info`` is suitable
     for merging into ``env.step`` output.
     """
+    phase_max_at_entry = int(state.phase_max)
+    receiver_grasped = False
+    handover_blocked_no_receiver_grasp = False
     phase_now, dbg = compute_phase_now(
         raw_obs, sim, body_ids, site_ids, table_top_z, cfg,
         phase_max=state.phase_max, success=success,
@@ -387,7 +405,8 @@ def compute_shaped_reward(
         g1_open = g1_span_v > cfg.grip_open_thresh
         g0_closed = g0_span_v < cfg.grip_closed_thresh
         g1_closed = g1_span_v < cfg.grip_closed_thresh
-
+        near0 = float(dbg["dist_e0_yellow"]) < float(cfg.near_thresh)
+        near1 = float(dbg["dist_e1_yellow"]) < float(cfg.near_thresh)
         if y_lift and state.lift_handover_first_grasp_arm is None:
             if g0_closed and not g1_closed:
                 state.lift_handover_first_grasp_arm = 0
@@ -398,18 +417,49 @@ def compute_shaped_reward(
                 d1 = float(dbg["dist_e1_yellow"])
                 state.lift_handover_first_grasp_arm = 0 if d0 <= d1 else 1
 
+        if state.lift_handover_first_grasp_arm == 0:
+            receiver_grasped = bool(g1_closed and near1)
+        elif state.lift_handover_first_grasp_arm == 1:
+            receiver_grasped = bool(g0_closed and near0)
+
         if not y_lift:
             phase_now = PHASE_REACH
         elif (
             state.phase_max >= PHASE_GRASP0
             and state.lift_handover_first_grasp_arm is not None
             and (
-                (state.lift_handover_first_grasp_arm == 0 and g0_open)
-                or (state.lift_handover_first_grasp_arm == 1 and g1_open)
+                (
+                    state.lift_handover_first_grasp_arm == 0
+                    and g0_open
+                    and g1_closed
+                    and near1
+                )
+                or (
+                    state.lift_handover_first_grasp_arm == 1
+                    and g1_open
+                    and g0_closed
+                    and near0
+                )
             )
         ):
             phase_now = PHASE_GRASP1
         else:
+            handover_blocked_no_receiver_grasp = bool(
+                state.phase_max >= PHASE_GRASP0
+                and state.lift_handover_first_grasp_arm is not None
+                and (
+                    (
+                        state.lift_handover_first_grasp_arm == 0
+                        and g0_open
+                        and not receiver_grasped
+                    )
+                    or (
+                        state.lift_handover_first_grasp_arm == 1
+                        and g1_open
+                        and not receiver_grasped
+                    )
+                )
+            )
             phase_now = PHASE_GRASP0
     new_phase_max = max(state.phase_max, phase_now)
 
@@ -442,8 +492,26 @@ def compute_shaped_reward(
 
     milestone = cfg.milestone_bonus * float(max(0, new_phase_max - state.prev_phase_max))
     success_term = cfg.success_bonus if success else 0.0
+    if (
+        success
+        and cfg.mode == "lift_handover"
+        and cfg.lift_handover_gate_success_bonus
+        and phase_max_at_entry < PHASE_GRASP1
+    ):
+        success_term *= float(cfg.lift_handover_shortcut_success_bonus_frac)
 
-    reward = shaping + milestone + success_term
+    lh_shortcut_penalty = 0.0
+    if (
+        cfg.mode == "lift_handover"
+        and cfg.lift_handover_shortcut_xy_thresh_m > 0.0
+        and cfg.lift_handover_shortcut_penalty_per_step != 0.0
+    ):
+        y_lift = float(dbg["yellow_lifted"]) >= 0.5
+        if y_lift and new_phase_max < PHASE_GRASP1 and not bool(base_success):
+            if float(dbg["dist_yellow_duct"]) < float(cfg.lift_handover_shortcut_xy_thresh_m):
+                lh_shortcut_penalty = float(cfg.lift_handover_shortcut_penalty_per_step)
+
+    reward = shaping + milestone + success_term + lh_shortcut_penalty
 
     state.prev_phase_max = new_phase_max
     state.phase_max = new_phase_max
@@ -456,11 +524,14 @@ def compute_shaped_reward(
         "milestone_reward": float(milestone),
         "success_reward": float(success_term),
         "phi_now": float(phi_now),
+        "lh_shortcut_penalty": float(lh_shortcut_penalty),
         **dbg,
     }
     if cfg.mode == "lift_handover":
         fa = state.lift_handover_first_grasp_arm
         info["lh_first_grasp_arm"] = float(fa) if fa is not None else -1.0
+        info["lh_receiver_grasped"] = float(receiver_grasped)
+        info["lh_blocked_no_receiver_grasp"] = float(handover_blocked_no_receiver_grasp)
     return float(reward), info
 
 

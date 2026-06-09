@@ -30,6 +30,7 @@ import json
 import logging
 import re
 import sys
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ import numpy as np
 
 from openpi.rlt.env_interface import RLEnvironment
 from openpi.rlt.shaped_reward import (
+    PHASE_GRASP1,
     PhaseTrackerState,
     ShapedRewardConfig,
     cache_sim_handles,
@@ -286,6 +288,17 @@ class RobosuiteRLTEnv(RLEnvironment):
             pair (same as ``groundTruthEval``).
         contact_solimp: If set, assign ``geom_solimp[:, :n]`` for the first ``n`` columns
             (e.g. three values for ``[dmin, dmax, width]``).
+        tape_layout_index: If set, every episode uses this index modulo the number of layouts
+            (``handover_index.json`` row or built-in grid). Mutually exclusive with
+            ``tape_layout_cycle``.
+        tape_layout_cycle: If True, cycle ``0, 1, …, N-1, 0, …`` on each :meth:`reset` so
+            training visits every layout in order. If False and ``tape_layout_index`` is
+            None, layouts are sampled uniformly at random each episode.
+        lift_handover_require_grasp1_for_success: When True (and shaped mode is absent or
+            ``lift_handover``), :meth:`task_completed` / episode ``done`` only treat robosuite
+            success as valid if ``phase_max >= PHASE_GRASP1`` (handover) was reached before
+            that success — shortcuts onto the duct tape without the handover phase do not
+            terminate or pay the sparse success bonus.
 
     Note:
         On the first call to :meth:`reset`, if the chosen tape layout index is ``0`` (from
@@ -305,6 +318,11 @@ class RobosuiteRLTEnv(RLEnvironment):
         contact_solref: list[float] | None = None,
         contact_solimp: list[float] | None = None,
         tape_layout_index: int | None = None,
+        tape_layout_cycle: bool = False,
+        lift_handover_require_grasp1_for_success: bool = False,
+        require_home_for_success: bool = False,
+        home_joint_tolerance: float = 0.20,
+        home_success_bonus: float = 0.0,
         gripper_action_log: str | Path | None = None,
         sim_states_dir: str | Path | None = None,
         shaped_reward_cfg: ShapedRewardConfig | None = None,
@@ -346,7 +364,12 @@ class RobosuiteRLTEnv(RLEnvironment):
         self._apply_contact_overrides(self._contact_solref, self._contact_solimp)
         self._raw_obs: dict[str, Any] = {}
         self._last_grip_cmd = np.array([1.0, 1.0], dtype=np.float64)
+        if tape_layout_cycle and tape_layout_index is not None:
+            raise ValueError("Use either tape_layout_cycle=True or tape_layout_index=..., not both.")
         self._tape_layout_index = tape_layout_index
+        self._tape_layout_cycle = bool(tape_layout_cycle)
+        self._layout_cycle_idx = 0
+        self._last_tape_layout_index: int = 0
         self._gripper_action_log_path = (
             str(Path(gripper_action_log).resolve()) if gripper_action_log else None
         )
@@ -372,6 +395,23 @@ class RobosuiteRLTEnv(RLEnvironment):
             else None
         )
         self._phase_state = PhaseTrackerState()
+        self._require_grasp1_for_success = bool(lift_handover_require_grasp1_for_success)
+        self._require_home_for_success = bool(require_home_for_success)
+        self._home_joint_tolerance = float(home_joint_tolerance)
+        self._home_success_bonus = float(home_success_bonus)
+        self._home_qpos0: np.ndarray | None = None
+        self._home_qpos1: np.ndarray | None = None
+        self._placed_after_handover_seen = False
+        self._last_effective_success = False
+        if self._require_grasp1_for_success and shaped_reward_cfg is not None:
+            if shaped_reward_cfg.mode != "lift_handover":
+                logger.warning(
+                    "lift_handover_require_grasp1_for_success=True is intended for "
+                    "shaped_reward_mode=lift_handover; got mode=%r — gate still uses "
+                    "lift_handover phase semantics (PHASE_GRASP1=%d).",
+                    shaped_reward_cfg.mode,
+                    PHASE_GRASP1,
+                )
         # Cache sim handles up front so the per-step path doesn't re-resolve them.
         # ``reset_from_xml_string`` rebuilds the model and invalidates IDs, so we
         # also re-cache after each sim-state restore.
@@ -379,6 +419,14 @@ class RobosuiteRLTEnv(RLEnvironment):
         self._site_ids: dict[str, int] = {}
         self._table_top_z: float = 0.0
         self._refresh_sim_handles()
+
+        # PyRoki handover oracle issues thousands of inner ``robosuite_env.step`` calls per
+        # macro; default horizon (often 1000) would set ``done`` mid-macro and the next
+        # step raises ``ValueError: executing action in terminated episode``.  We relax
+        # horizon checks during / after a macro and restore the original ``ignore_done``
+        # at the start of each :meth:`reset`.
+        self._pyroki_relax_robosuite_horizon = False
+        self._pyroki_saved_ignore_done: bool | None = None
 
     def _load_sim_states(self, sim_states_dir: Path, *, use_wrist_cameras: bool) -> None:
         """Load pre-captured sim state snapshots from *sim_states_dir*.
@@ -606,13 +654,30 @@ class RobosuiteRLTEnv(RLEnvironment):
         # Fresh phase tracker for the new episode (sticky milestone counter
         # must not leak between episodes).
         self._phase_state = PhaseTrackerState()
+        self._placed_after_handover_seen = False
+        self._last_effective_success = False
+
+        rs = self.env.robosuite_env
+        if self._pyroki_relax_robosuite_horizon and self._pyroki_saved_ignore_done is not None:
+            rs.ignore_done = self._pyroki_saved_ignore_done
+            self._pyroki_relax_robosuite_horizon = False
+            self._pyroki_saved_ignore_done = None
 
         last_exc: Exception | None = None
+        # For layout-cycle mode, keep the same index across RandomizationError retries
+        # (only advance the cycle counter once per successful reset *attempt series*).
+        idx_cycle_pinned: int | None = None
         for attempt in range(_RESET_MAX_ATTEMPTS):
-            if self._tape_layout_index is not None:
+            if self._tape_layout_cycle:
+                if idx_cycle_pinned is None:
+                    idx_cycle_pinned = int(self._layout_cycle_idx) % len(self._tape_combos)
+                    self._layout_cycle_idx += 1
+                idx = idx_cycle_pinned
+            elif self._tape_layout_index is not None:
                 idx = int(self._tape_layout_index) % len(self._tape_combos)
             else:
                 idx = int(self._rng.integers(len(self._tape_combos)))
+            self._last_tape_layout_index = int(idx)
             (yellow_x, yellow_y), (duct_x, duct_y) = self._tape_combos[idx]
             self._update_tape_positions(yellow_x, yellow_y, duct_x, duct_y)
 
@@ -694,6 +759,15 @@ class RobosuiteRLTEnv(RLEnvironment):
                         else:
                             gf.write(f"\n# episode {self._gripper_log_episode_idx}\n")
                     self._gripper_log_episode_idx += 1
+                if self._home_qpos0 is None or self._home_qpos1 is None:
+                    self._home_qpos0 = np.asarray(
+                        self._raw_obs.get("robot0_joint_pos", np.zeros(7)),
+                        dtype=np.float64,
+                    ).copy()
+                    self._home_qpos1 = np.asarray(
+                        self._raw_obs.get("robot1_joint_pos", np.zeros(7)),
+                        dtype=np.float64,
+                    ).copy()
                 return out
             except RandomizationError as exc:
                 last_exc = exc
@@ -707,6 +781,123 @@ class RobosuiteRLTEnv(RLEnvironment):
         raise RuntimeError(
             f"Environment reset failed after {_RESET_MAX_ATTEMPTS} attempts"
         ) from last_exc
+
+    def _handover_success_gate_enabled(self) -> bool:
+        return self._require_grasp1_for_success and (
+            self._shaped_cfg is None or self._shaped_cfg.mode == "lift_handover"
+        )
+
+    def _home_distances(self) -> tuple[float, float]:
+        if self._home_qpos0 is None or self._home_qpos1 is None:
+            return float("inf"), float("inf")
+        q0 = np.asarray(self._raw_obs.get("robot0_joint_pos", np.zeros_like(self._home_qpos0)))
+        q1 = np.asarray(self._raw_obs.get("robot1_joint_pos", np.zeros_like(self._home_qpos1)))
+        d0 = float(np.linalg.norm(q0 - self._home_qpos0))
+        d1 = float(np.linalg.norm(q1 - self._home_qpos1))
+        return d0, d1
+
+    def _compute_rl_reward(
+        self, *, phase_max_before: int, base_success: bool
+    ) -> tuple[float, dict[str, Any], bool]:
+        """Sparse/shaped reward, info dict, and *effective* terminal success for RL."""
+        gate = self._handover_success_gate_enabled()
+        effective = bool(base_success) and (
+            not gate or int(phase_max_before) >= int(PHASE_GRASP1)
+        )
+
+        cfg_use: ShapedRewardConfig | None
+        if self._shaped_cfg is not None:
+            cfg_use = self._shaped_cfg
+        elif gate:
+            # Eval (or callers) with no shaped cfg: track lift_handover phases but keep
+            # reward sparse (milestone_bonus=0, success_bonus=1 on effective success only).
+            cfg_use = ShapedRewardConfig(
+                mode="lift_handover",
+                milestone_bonus=0.0,
+                success_bonus=1.0,
+            )
+        else:
+            cfg_use = None
+
+        if cfg_use is not None:
+            if bool(base_success) and gate and int(phase_max_before) < int(PHASE_GRASP1):
+                # Probe phase advancement on this same sim step without consuming
+                # the real tracker state. This avoids missing valid terminal
+                # success when handover (phase 3) and placement fire together.
+                phase_probe_state = copy.deepcopy(self._phase_state)
+                _probe_reward, probe_info = compute_shaped_reward(
+                    raw_obs=self._raw_obs,
+                    sim=self.env.robosuite_env.sim,
+                    body_ids=self._body_ids,
+                    site_ids=self._site_ids,
+                    table_top_z=self._table_top_z,
+                    success=False,
+                    state=phase_probe_state,
+                    cfg=cfg_use,
+                )
+                phase_max_after_probe = int(probe_info.get("phase_max", phase_max_before))
+                if phase_max_after_probe >= int(PHASE_GRASP1):
+                    effective = True
+
+            if effective:
+                self._placed_after_handover_seen = True
+            d0_home, d1_home = self._home_distances()
+            both_home = (
+                d0_home <= self._home_joint_tolerance and d1_home <= self._home_joint_tolerance
+            )
+            if self._require_home_for_success:
+                effective = bool(self._placed_after_handover_seen and both_home)
+
+            reward, shaped_info = compute_shaped_reward(
+                raw_obs=self._raw_obs,
+                sim=self.env.robosuite_env.sim,
+                body_ids=self._body_ids,
+                site_ids=self._site_ids,
+                table_top_z=self._table_top_z,
+                success=effective,
+                base_success=bool(base_success) or bool(self._placed_after_handover_seen),
+                state=self._phase_state,
+                cfg=cfg_use,
+            )
+            if effective and self._home_success_bonus != 0.0:
+                reward += float(self._home_success_bonus)
+            info: dict[str, Any] = {
+                "success": effective,
+                "base_success": bool(base_success),
+                "placed_after_handover_seen": float(self._placed_after_handover_seen),
+                "home_dist_arm0": float(d0_home),
+                "home_dist_arm1": float(d1_home),
+                "both_arms_home": float(both_home),
+                "home_success_bonus": float(self._home_success_bonus if effective else 0.0),
+                **shaped_info,
+            }
+            return float(reward), info, effective
+
+        if effective:
+            self._placed_after_handover_seen = True
+        d0_home, d1_home = self._home_distances()
+        both_home = d0_home <= self._home_joint_tolerance and d1_home <= self._home_joint_tolerance
+        if self._require_home_for_success:
+            effective = bool(self._placed_after_handover_seen and both_home)
+        reward = 1.0 if effective else 0.0
+        if effective and self._home_success_bonus != 0.0:
+            reward += float(self._home_success_bonus)
+        info = {
+            "success": effective,
+            "base_success": bool(base_success),
+            "placed_after_handover_seen": float(self._placed_after_handover_seen),
+            "home_dist_arm0": float(d0_home),
+            "home_dist_arm1": float(d1_home),
+            "both_arms_home": float(both_home),
+            "home_success_bonus": float(self._home_success_bonus if effective else 0.0),
+            "phase": 0,
+            "phase_max": 0,
+            "shaping_reward": 0.0,
+            "milestone_reward": 0.0,
+            "success_reward": float(reward),
+            "phi_now": 0.0,
+        }
+        return float(reward), info, effective
 
     def step(self, action: np.ndarray) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
         """Execute a single action step.
@@ -730,33 +921,20 @@ class RobosuiteRLTEnv(RLEnvironment):
         self._raw_obs = self.env.get_observation()
         obs = self._format_obs(self._raw_obs)
 
-        success = self.task_completed()
-        if self._shaped_cfg is not None:
-            reward, shaped_info = compute_shaped_reward(
-                raw_obs=self._raw_obs,
-                sim=self.env.robosuite_env.sim,
-                body_ids=self._body_ids,
-                site_ids=self._site_ids,
-                table_top_z=self._table_top_z,
-                success=success,
-                state=self._phase_state,
-                cfg=self._shaped_cfg,
-            )
-            info: dict[str, Any] = {"success": success, **shaped_info}
-        else:
-            reward = 1.0 if success else 0.0
-            # Always include phase fields (zeros) so downstream consumers can read
-            # them without branching on whether shaping is enabled.
-            info = {
-                "success": success,
-                "phase": 0,
-                "phase_max": 0,
-                "shaping_reward": 0.0,
-                "milestone_reward": 0.0,
-                "success_reward": float(reward),
-                "phi_now": 0.0,
-            }
-        done = success or self.env._step_count >= self.env.max_steps
+        phase_max_before = int(self._phase_state.phase_max)
+        base_success = bool(self.env.task_completed())
+        reward, info, effective_success = self._compute_rl_reward(
+            phase_max_before=phase_max_before,
+            base_success=base_success,
+        )
+        self._last_effective_success = effective_success
+        shortcut_terminal = (
+            bool(base_success)
+            and not bool(effective_success)
+            and (not self._require_home_for_success or not self._placed_after_handover_seen)
+        )
+        info["shortcut_terminal"] = float(shortcut_terminal)
+        done = effective_success or shortcut_terminal or self.env._step_count >= self.env.max_steps
         self.env._step_count += 1
 
         return obs, reward, done, info
@@ -765,6 +943,128 @@ class RobosuiteRLTEnv(RLEnvironment):
         """Return current 16D proprioceptive state."""
         return format_proprio(self._raw_obs)
 
+    @property
+    def last_tape_layout_index(self) -> int:
+        """Tape combo index used in the last completed :meth:`reset` (for Wandb / debugging)."""
+        return int(self._last_tape_layout_index)
+
     def task_completed(self) -> bool:
-        """Check if the task has been successfully completed."""
-        return self.env.task_completed()
+        """Effective task success for RLT (may require handover phase before robosuite success)."""
+        return bool(self._last_effective_success)
+
+    # ------------------------------------------------------------------
+    # PyRoki oracle macro entry point (used by --handover_controller pyroki).
+    # ------------------------------------------------------------------
+    def run_pyroki_handover_macro(
+        self,
+        oracle: Any | None = None,
+        *,
+        oracle_kwargs: dict[str, Any] | None = None,
+        check_picker_arm: bool = True,
+    ) -> dict[str, Any]:
+        """Run the blocking PyRoki handover macro on the wrapped env.
+
+        The macro is implemented in :mod:`openpi.rlt.pyroki_handover` and
+        consumes many inner ``robosuite_env.step`` calls in one logical
+        rollout step. After it returns we rebuild the observation, recompute
+        shaped reward / success exactly as :meth:`step` would, and report
+        back the number of inner sim steps so the rollout loop can advance
+        its own ``ep_steps`` counter accordingly.
+
+        Args:
+            oracle: Pre-built :class:`PyrokiHandoverOracle`. If ``None``, one
+                is constructed on the wrapped env using ``oracle_kwargs``
+                and cached on the wrapper for subsequent calls.
+            oracle_kwargs: Forwarded to ``PyrokiHandoverOracle.__init__`` on
+                lazy construction.  Ignored when ``oracle`` is supplied.
+            check_picker_arm: When True (default), call
+                :meth:`PyrokiHandoverOracle.assert_arm1_holds_tape` first so an
+                arm0-led pick raises :class:`HandoverPickerMismatchError`
+                BEFORE any IK runs (lets the caller fall back to RLT/VLA).
+
+        Returns:
+            Dict with:
+                - ``obs``: formatted observation (same shape as :meth:`step`).
+                - ``reward``: shaped reward at the final post-macro state
+                  (single scalar; per-inner-step shaping is collapsed since
+                  the actor isn't training during the macro).
+                - ``done``: ``True`` iff effective task success (same gate as
+                  :meth:`step`) or the env's max_steps budget has been hit by the macro.
+                - ``info``: shaped-reward info dict (same fields as
+                  :meth:`step`'s info), augmented with macro diagnostics:
+                  ``inner_steps`` (int), ``oracle_succeeded`` (bool),
+                  ``oracle_skipped_reason`` (str | None).
+                - ``inner_steps``: same value as ``info['inner_steps']``,
+                  hoisted to the top level for ergonomic access by the
+                  rollout loop.
+        """
+        from openpi.rlt.pyroki_handover import PyrokiHandoverOracle
+
+        if oracle is None:
+            cached = getattr(self, "_pyroki_oracle", None)
+            if cached is None:
+                cached = PyrokiHandoverOracle(self.env, **(oracle_kwargs or {}))
+                self._pyroki_oracle = cached  # noqa: SLF001 — internal cache
+            oracle = cached
+
+        if check_picker_arm:
+            # Raises HandoverPickerMismatchError on arm0-led picks; the caller
+            # is responsible for catching + logging + falling back.
+            oracle.assert_arm1_holds_tape()
+
+        rs = self.env.robosuite_env
+        if not self._pyroki_relax_robosuite_horizon:
+            self._pyroki_saved_ignore_done = bool(rs.ignore_done)
+            self._pyroki_relax_robosuite_horizon = True
+        rs.ignore_done = True
+        # If a previous crash left ``done`` set, unblock the oracle's first step.
+        rs.done = False
+
+        result = oracle.run()
+        inner_steps = int(result.inner_steps)
+
+        self._raw_obs = self.env.get_observation()
+        obs = self._format_obs(self._raw_obs)
+
+        phase_max_before = int(self._phase_state.phase_max)
+        base_success = bool(self.env.task_completed())
+        reward, info, effective_success = self._compute_rl_reward(
+            phase_max_before=phase_max_before,
+            base_success=base_success,
+        )
+        self._last_effective_success = effective_success
+
+        # Bump the wrapper-level step counter by however many inner sim
+        # steps the macro consumed so the env's own max_steps budget stays
+        # aligned with the caller's ep_steps tracking.
+        self.env._step_count += inner_steps  # noqa: SLF001
+        shortcut_terminal = (
+            bool(base_success)
+            and not bool(effective_success)
+            and (not self._require_home_for_success or not self._placed_after_handover_seen)
+        )
+        info["shortcut_terminal"] = float(shortcut_terminal)
+        done = (
+            effective_success
+            or shortcut_terminal
+            or self.env._step_count >= self.env.max_steps
+            or result.skipped_reason == "sim_step_budget_exhausted"
+        )
+
+        info["inner_steps"] = inner_steps
+        info["oracle_succeeded"] = bool(result.succeeded)
+        info["oracle_skipped_reason"] = result.skipped_reason
+
+        # Keep gripper-zero-hold state consistent with whatever the oracle
+        # left the fingers at, so any subsequent VLA-driven steps don't
+        # inherit a stale "hold" command.
+        st = obs["state"]
+        self._last_grip_cmd = np.array([float(st[7]), float(st[15])], dtype=np.float64)
+
+        return {
+            "obs": obs,
+            "reward": float(reward),
+            "done": bool(done),
+            "info": info,
+            "inner_steps": inner_steps,
+        }

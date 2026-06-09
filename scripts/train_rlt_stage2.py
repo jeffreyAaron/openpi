@@ -57,6 +57,7 @@ import pathlib
 import tempfile
 import threading
 import time
+from collections import deque
 from typing import Any
 
 import jax
@@ -404,7 +405,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="If set with --robosuite_tape_offsets_json, always use this index into the combo list "
-        "(same ordering as GTE's JSON) so episode 0 matches a chosen layout (e.g. 0 = first entry).",
+        "(same ordering as GTE's JSON) so episode 0 matches a chosen layout (e.g. 0 = first entry). "
+        "Mutually exclusive with --robosuite_layout_cycle.",
+    )
+    parser.add_argument(
+        "--robosuite_layout_cycle",
+        action="store_true",
+        help="Cycle tape layout index 0..N-1 on each episode reset (N = len(handover_index.json) "
+        "or 64 built-in combos). Ensures training covers every layout. Mutually exclusive with "
+        "--robosuite_fixed_layout_index. If neither cycle nor fixed index is set, layouts are "
+        "sampled uniformly at random each episode.",
     )
     parser.add_argument(
         "--gripper_action_log",
@@ -442,6 +452,57 @@ def parse_args() -> argparse.Namespace:
         "(matches raw TrainConfig). Default off: strip them for sim (recommended).",
     )
 
+    # --- PyRoki handover oracle (replaces RLT actor during the handover phase) ---
+    parser.add_argument(
+        "--handover_controller",
+        type=str,
+        default="rlt",
+        choices=["rlt", "pyroki"],
+        help="rlt (default): GaussianActor drives the handover phase. "
+        "pyroki: blocking PyRoki IK macro (adapted from "
+        "mike/dependencies/robosuite/test_scripts/handover_step.py) drives it instead. "
+        "VLA still owns pickup/lift and placement. Implies --shaped_reward_mode "
+        "lift_handover + --phase_mode task_phase + --actor_task_phases 1, and "
+        "force-disables the async learner (no actor updates while the oracle drives).",
+    )
+    parser.add_argument(
+        "--pyroki_x_shift",
+        type=float,
+        default=0.0,
+        help="Handover geometry x-shift forwarded to PyrokiHandoverOracle "
+        "(matches handover_step.py --x_shift).",
+    )
+    parser.add_argument(
+        "--pyroki_y_shift",
+        type=float,
+        default=0.0,
+        help="Handover geometry y-shift forwarded to PyrokiHandoverOracle "
+        "(matches handover_step.py --y_shift).",
+    )
+    parser.add_argument(
+        "--pyroki_angle_shift",
+        type=float,
+        default=0.0,
+        help="Handover geometry angle-shift (rad about z) forwarded to "
+        "PyrokiHandoverOracle (matches handover_step.py --angle_shift).",
+    )
+    parser.add_argument(
+        "--pyroki_perturb_radius",
+        type=float,
+        default=0.0,
+        help="Lateral waypoint perturbation radius (m) for the PyRoki macro. "
+        "0.0 (default) = deterministic handover. Matches handover_step.py "
+        "--perturb_radius.",
+    )
+    parser.add_argument(
+        "--pyroki_skip_on_arm0_pick",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When True (default), if lift_handover detects arm0 was the picker, "
+        "skip the PyRoki macro and fall back to the VLA path for that episode "
+        "(the macro is hard-coded for arm1-led picks). Disable to force the "
+        "macro and let it raise.",
+    )
     # MuJoCo-specific args (ignored when --env robosuite).
     parser.add_argument("--task", type=str, default="tape_handover_random",
                         help="Task key from eye.mujoco.tasks.TASK_REGISTRY.")
@@ -479,6 +540,59 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shaped_lift_thresh", type=float, default=None,
                         help="Yellow tape z above table top required to count as 'lifted'. "
                              "Defaults to ShapedRewardConfig.lift_thresh (~0.02 m).")
+    parser.add_argument(
+        "--shaped_lift_handover_shortcut_xy_thresh",
+        type=float,
+        default=0.0,
+        help="lift_handover only: xy yellow↔duct distance (m) below which we apply "
+        "shortcut_penalty_per_step while tape is lifted and phase_max < PHASE_GRASP1. "
+        "0 disables.",
+    )
+    parser.add_argument(
+        "--shaped_lift_handover_shortcut_penalty",
+        type=float,
+        default=0.0,
+        help="lift_handover only: per-step reward added when shortcut_xy_thresh triggers "
+        "(use a negative value, e.g. -0.002). 0 disables.",
+    )
+    parser.add_argument(
+        "--shaped_lift_handover_gate_success_bonus",
+        action="store_true",
+        help="lift_handover only: if task success fires before phase_max reached PHASE_GRASP1 "
+        "(handover), scale shaped success_bonus by --shaped_lift_handover_shortcut_success_bonus_frac.",
+    )
+    parser.add_argument(
+        "--shaped_lift_handover_shortcut_success_bonus_frac",
+        type=float,
+        default=0.0,
+        help="lift_handover + --shaped_lift_handover_gate_success_bonus: multiply success_bonus "
+        "by this when success is a shortcut (e.g. 0.15). 0.0 removes the bonus on shortcuts.",
+    )
+    parser.add_argument(
+        "--shaped_lift_handover_require_grasp1_for_task_success",
+        action="store_true",
+        help="lift_handover (or sparse eval when this flag is set): robosuite task_complete only "
+        "counts as RL success / episode termination if phase_max reached PHASE_GRASP1 (3) "
+        "before that step — no shortcut placement on the duct tape.",
+    )
+    parser.add_argument(
+        "--shaped_require_home_for_task_success",
+        action="store_true",
+        help="Require both arms to return near their reset (home) joint pose before "
+        "counting task success / episode termination.",
+    )
+    parser.add_argument(
+        "--shaped_home_joint_tolerance",
+        type=float,
+        default=0.20,
+        help="L2 joint-space tolerance (radians) per arm for home success.",
+    )
+    parser.add_argument(
+        "--shaped_home_success_bonus",
+        type=float,
+        default=0.0,
+        help="Extra bonus added on terminal success when home criterion is met.",
+    )
 
     return parser.parse_args()
 
@@ -505,6 +619,15 @@ def build_shaped_reward_cfg(args, *, discount: float | None = None) -> "ShapedRe
         kwargs["potential_discount"] = float(discount)
     if args.shaped_lift_thresh is not None:
         kwargs["lift_thresh"] = float(args.shaped_lift_thresh)
+    if float(args.shaped_lift_handover_shortcut_xy_thresh) > 0.0:
+        kwargs["lift_handover_shortcut_xy_thresh_m"] = float(args.shaped_lift_handover_shortcut_xy_thresh)
+    if float(args.shaped_lift_handover_shortcut_penalty) != 0.0:
+        kwargs["lift_handover_shortcut_penalty_per_step"] = float(args.shaped_lift_handover_shortcut_penalty)
+    if args.shaped_lift_handover_gate_success_bonus:
+        kwargs["lift_handover_gate_success_bonus"] = True
+        kwargs["lift_handover_shortcut_success_bonus_frac"] = float(
+            args.shaped_lift_handover_shortcut_success_bonus_frac,
+        )
     return ShapedRewardConfig(**kwargs)
 
 
@@ -792,6 +915,9 @@ def evaluate(
     actor_lock: threading.Lock | None = None,
     phase_x: int = 0,
     phase_y: int | None = None,
+    handover_controller: str = "rlt",
+    pyroki_oracle_kwargs: dict[str, Any] | None = None,
+    pyroki_skip_on_arm0_pick: bool = True,
 ) -> dict[str, float]:
     """Evaluate with the same rollout cadence / smoothing as training.
 
@@ -802,6 +928,11 @@ def evaluate(
     When ``cfg.phase_mode != "off"``, control is gated by ``[phase_x, phase_y)`` exactly as in
     the training rollout loop, including resetting the action smoother at each phase boundary
     (when ``cfg.phase_reset_smoothing``).
+
+    When ``handover_controller == "pyroki"``, the actor branch is replaced by a single
+    blocking PyRoki macro per episode (same logic as the training rollout). On
+    HandoverPickerMismatchError the macro is skipped and control falls through to the
+    actor (or VLA under ``vla_only``).
     """
     actor.eval()
     successes = 0
@@ -826,8 +957,59 @@ def evaluate(
         prev_use_actor: bool | None = None
         current_phase_max = 0
         tape_drop_streak = 0
+        pyroki_macro_attempted = False
 
         while not done and ep_steps < cfg.max_episode_steps:
+            should_run_pyroki_macro = (
+                handover_controller == "pyroki"
+                and not vla_only
+                and not pyroki_macro_attempted
+                and _phase_use_actor(
+                    ep_steps,
+                    phase_mode=cfg.phase_mode,
+                    x=phase_x,
+                    y=phase_y,
+                    is_warmup=False,
+                    vla_only=False,
+                    phase_max=current_phase_max,
+                    actor_task_phases=cfg.actor_task_phases,
+                    end_actor_after_handover=cfg.end_actor_after_handover,
+                )
+            )
+            if should_run_pyroki_macro:
+                from openpi.rlt.pyroki_handover import HandoverPickerMismatchError
+
+                pyroki_macro_attempted = True
+                try:
+                    macro_result = env.run_pyroki_handover_macro(
+                        oracle_kwargs=pyroki_oracle_kwargs or {},
+                        check_picker_arm=pyroki_skip_on_arm0_pick,
+                    )
+                except HandoverPickerMismatchError as exc:
+                    logger.warning("eval: PyRoki macro skipped — %s", exc)
+                    macro_result = None
+                if macro_result is not None:
+                    obs_dict = macro_result["obs"]
+                    ep_reward += float(macro_result["reward"])
+                    ep_steps += int(macro_result["inner_steps"])
+                    current_phase_max = max(
+                        current_phase_max,
+                        int(macro_result["info"].get("phase_max", 0)),
+                    )
+                    if macro_result["done"]:
+                        done = True
+                        continue
+                    smooth = ActionSmoothingRuntime.start_episode(
+                        cfg.action_smoothing,
+                        te_k=cfg.te_k,
+                        ema_alpha=cfg.ema_alpha,
+                    )
+                    prev_use_actor = True
+                    remainder = ep_steps % infer_every
+                    if remainder != 0:
+                        ep_steps += (infer_every - remainder)
+                    continue
+
             if ep_steps % infer_every == 0:
                 use_actor_now = _phase_use_actor(
                     ep_steps,
@@ -1086,6 +1268,11 @@ def log_rollout_wandb(
         if ok:
             logger.info(f"Rollout video saved: {video_path}")
             log_dict["rollout/video"] = wandb.Video(video_path)
+            # Quick-at-a-glance diagnostic: where the rollout ended.
+            log_dict["rollout/final_frame"] = wandb.Image(
+                frames[-1],
+                caption=f"episode={episode} final frame",
+            )
         else:
             logger.warning("Failed to encode rollout video — skipping.")
 
@@ -1289,6 +1476,43 @@ def train(args: argparse.Namespace) -> None:
             "computed (use 'lift_only' for the simple z-threshold gate)."
         )
 
+    # PyRoki handover oracle prerequisites. The oracle replaces the RLT actor
+    # during the handover window, so it needs (a) shaped reward in
+    # `lift_handover` mode (so phase_max ticks 0 -> 1 on lift, then 1 -> 3 once
+    # the macro completes), (b) `phase_mode=task_phase` with `actor_task_phases`
+    # containing 1 (so the gate fires exactly during the handover), and (c) no
+    # async learner (no actor updates make sense while a fixed oracle drives).
+    if args.handover_controller == "pyroki":
+        if args.shaped_reward_mode != "lift_handover":
+            raise ValueError(
+                "--handover_controller pyroki requires --shaped_reward_mode "
+                "lift_handover so phase_max ticks 0 -> 1 -> 3 around the macro. "
+                f"Got --shaped_reward_mode {args.shaped_reward_mode!r}."
+            )
+        if cfg.phase_mode != "task_phase":
+            raise ValueError(
+                "--handover_controller pyroki requires --phase_mode task_phase so "
+                "the oracle is invoked exactly during the handover window. "
+                f"Got --phase_mode {cfg.phase_mode!r}."
+            )
+        if 1 not in set(cfg.actor_task_phases):
+            raise ValueError(
+                "--handover_controller pyroki requires --actor_task_phases to include 1 "
+                "(handover is gated on phase_max == 1 in lift_handover mode). "
+                f"Got --actor_task_phases {list(cfg.actor_task_phases)}."
+            )
+        if args.async_learning:
+            logger.warning(
+                "--handover_controller pyroki: force-disabling async learner. "
+                "The oracle drives the handover, so the actor receives no on-policy "
+                "transitions and no off-policy updates would be meaningful.",
+            )
+            args.async_learning = False
+        if args.vla_only:
+            logger.warning(
+                "--handover_controller pyroki combined with --vla_only is unusual: "
+                "--vla_only forces VLA execution and the macro will never fire.",
+            )
     # The drop / handover signals come from the shaped-reward phase tracker. If the
     # user disabled shaped reward, both flags are silent no-ops.
     if cfg.end_on_tape_drop and args.shaped_reward_mode == "off":
@@ -1482,6 +1706,10 @@ def train(args: argparse.Namespace) -> None:
         tape_json = args.robosuite_tape_offsets_json
         contact_solref = args.robosuite_contact_solref
         contact_solimp = args.robosuite_contact_solimp
+        if args.robosuite_layout_cycle and args.robosuite_fixed_layout_index is not None:
+            raise ValueError(
+                "Use either --robosuite_layout_cycle or --robosuite_fixed_layout_index, not both.",
+            )
         layout_idx = args.robosuite_fixed_layout_index
         grip_log = args.gripper_action_log
         sim_states_dir = args.sim_states_dir
@@ -1498,6 +1726,18 @@ def train(args: argparse.Namespace) -> None:
                 shaped_cfg.mode, shaped_cfg.milestone_bonus, shaped_cfg.success_bonus,
                 shaped_cfg.potential_discount,
             )
+        if args.shaped_lift_handover_require_grasp1_for_task_success:
+            logger.info(
+                "Handover success gate: task success requires phase_max >= PHASE_GRASP1 "
+                "before robosuite task_complete (train + eval)."
+            )
+        if args.shaped_require_home_for_task_success:
+            logger.info(
+                "Home success gate enabled: require both arms within %.3f rad of home "
+                "before terminal success (home_success_bonus=%.3f).",
+                float(args.shaped_home_joint_tolerance),
+                float(args.shaped_home_success_bonus),
+            )
         env = RobosuiteRLTEnv(
             controller_cfg=args.robosuite_controller_cfg,
             image_size=args.robosuite_image_size,
@@ -1508,6 +1748,13 @@ def train(args: argparse.Namespace) -> None:
             contact_solref=contact_solref,
             contact_solimp=contact_solimp,
             tape_layout_index=layout_idx,
+            tape_layout_cycle=args.robosuite_layout_cycle,
+            lift_handover_require_grasp1_for_success=(
+                args.shaped_lift_handover_require_grasp1_for_task_success
+            ),
+            require_home_for_success=args.shaped_require_home_for_task_success,
+            home_joint_tolerance=float(args.shaped_home_joint_tolerance),
+            home_success_bonus=float(args.shaped_home_success_bonus),
             gripper_action_log=grip_log,
             sim_states_dir=sim_states_dir,
             shaped_reward_cfg=shaped_cfg,
@@ -1522,6 +1769,13 @@ def train(args: argparse.Namespace) -> None:
             contact_solref=contact_solref,
             contact_solimp=contact_solimp,
             tape_layout_index=layout_idx,
+            tape_layout_cycle=args.robosuite_layout_cycle,
+            lift_handover_require_grasp1_for_success=(
+                args.shaped_lift_handover_require_grasp1_for_task_success
+            ),
+            require_home_for_success=args.shaped_require_home_for_task_success,
+            home_joint_tolerance=float(args.shaped_home_joint_tolerance),
+            home_success_bonus=float(args.shaped_home_success_bonus),
             gripper_action_log=None,
             sim_states_dir=sim_states_dir,
             shaped_reward_cfg=None,
@@ -1601,6 +1855,8 @@ def train(args: argparse.Namespace) -> None:
     post_warmup_env_steps = 0  # Env steps counted toward UTD (paper: learning starts post-warmup).
     total_updates = 0
     log_video = args.log_video_interval > 0
+    phase_stats_window_size = 50
+    recent_phase_max: deque[int] = deque(maxlen=phase_stats_window_size)
 
     pbar = tqdm.tqdm(
         range(cfg.num_episodes),
@@ -1614,6 +1870,7 @@ def train(args: argparse.Namespace) -> None:
     for episode in pbar:
         is_warmup = args.vla_only or (episode < cfg.warmup_episodes)
         obs_dict = env.reset()
+        tape_layout_idx_ep = int(getattr(env, "last_tape_layout_index", -1))
         done = False
         ep_reward = 0.0
         ep_steps = 0
@@ -1622,6 +1879,12 @@ def train(args: argparse.Namespace) -> None:
         ep_phase_max = 0
         ep_shaping_sum = 0.0
         ep_milestone_sum = 0.0
+        ep_lh_shortcut_penalty_sum = 0.0
+        ep_lh_receiver_grasped_steps = 0
+        ep_lh_blocked_no_receiver_grasp_steps = 0
+        ep_shortcut_terminal = False
+        ep_both_home_steps = 0
+        ep_home_bonus_sum = 0.0
 
         # Collect per-step data for subsampled buffer insertion.
         ep_z_rls = []
@@ -1658,6 +1921,13 @@ def train(args: argparse.Namespace) -> None:
         # still seed replay over the same state distribution the actor will control.
         ep_in_replay_window: list[bool] = []
 
+        # PyRoki handover oracle: at most one macro firing per episode. If the
+        # macro raises HandoverPickerMismatchError (arm0-led pick) or
+        # otherwise fails, this flag still gets set so we don't retry every
+        # iteration; control falls through to the regular actor / VLA path.
+        pyroki_macro_attempted = False
+        pyroki_macro_succeeded = False
+
         # Track the last phase_max we drew a video frame for, so we can force
         # an additional capture on every transition. Without this, a brief
         # phase (e.g. lift_handover phase 1, which can last only a handful of
@@ -1682,6 +1952,142 @@ def train(args: argparse.Namespace) -> None:
         while not done and ep_steps < cfg.max_episode_steps:
             # One video frame per VLA+actor cycle: captured *after* each chunk of
             # ``infer_every`` env.step calls so overlay matches cumulative reward.
+
+            # --- PyRoki handover oracle (replaces the actor for the handover phase) ---
+            # The macro consumes many inner sim steps in one logical call, so we
+            # check this BEFORE the per-chunk inference block: if it fires we
+            # short-circuit the rest of the iteration, advance ep_steps by the
+            # number of inner sim steps consumed, and rely on _phase_use_actor
+            # returning False on the next iteration (phase_max jumps 1 -> 3 post-
+            # macro, so end_actor_after_handover hands control back to the VLA).
+            should_run_pyroki_macro = (
+                args.handover_controller == "pyroki"
+                and not is_warmup
+                and not args.vla_only
+                and not pyroki_macro_attempted
+                and _phase_use_actor(
+                    ep_steps,
+                    phase_mode=cfg.phase_mode,
+                    x=phase_x,
+                    y=phase_y,
+                    is_warmup=False,
+                    vla_only=False,
+                    phase_max=current_phase_max,
+                    actor_task_phases=cfg.actor_task_phases,
+                    end_actor_after_handover=cfg.end_actor_after_handover,
+                )
+            )
+            if should_run_pyroki_macro:
+                from openpi.rlt.pyroki_handover import HandoverPickerMismatchError
+
+                pyroki_macro_attempted = True
+                try:
+                    macro_result = env.run_pyroki_handover_macro(
+                        oracle_kwargs=dict(
+                            x_shift=args.pyroki_x_shift,
+                            y_shift=args.pyroki_y_shift,
+                            angle_shift=args.pyroki_angle_shift,
+                            perturb_radius=args.pyroki_perturb_radius,
+                            seed=args.seed + episode,
+                        ),
+                        check_picker_arm=args.pyroki_skip_on_arm0_pick,
+                    )
+                except HandoverPickerMismatchError as exc:
+                    logger.warning(
+                        "ep=%d step=%d: PyRoki macro skipped — %s",
+                        episode, ep_steps, exc,
+                    )
+                    macro_result = None
+
+                if macro_result is not None:
+                    pyroki_macro_succeeded = True
+                    obs_dict = macro_result["obs"]
+                    macro_inner_steps = int(macro_result["inner_steps"])
+                    macro_info = macro_result["info"]
+                    macro_reward = float(macro_result["reward"])
+                    macro_done = bool(macro_result["done"])
+
+                    # Logging-only per-episode aggregates. Replay buffer is
+                    # suppressed entirely for pyroki episodes (validated at
+                    # startup), so we don't append to ep_z_rls / ep_actions /
+                    # ep_ref_actions / ep_states (the macro doesn't produce
+                    # 16D bimanual chunks anyway).
+                    ep_rewards.append(macro_reward)
+                    ep_dones.append(macro_done)
+                    ep_actor_drove.append(True)
+                    ep_reward += macro_reward
+                    ep_shaping_sum += float(macro_info.get("shaping_reward", 0.0))
+                    ep_milestone_sum += float(macro_info.get("milestone_reward", 0.0))
+                    ep_lh_receiver_grasped_steps += int(
+                        float(macro_info.get("lh_receiver_grasped", 0.0)) > 0.5
+                    )
+                    ep_lh_blocked_no_receiver_grasp_steps += int(
+                        float(macro_info.get("lh_blocked_no_receiver_grasp", 0.0)) > 0.5
+                    )
+                    current_phase_max = max(
+                        current_phase_max, int(macro_info.get("phase_max", 0)),
+                    )
+                    ep_phase_max = max(ep_phase_max, current_phase_max)
+                    ep_actor_steps += 1  # one logical actor-driven "chunk"
+                    ep_steps += macro_inner_steps
+                    total_env_steps += macro_inner_steps
+
+                    # Drop stale TE / EMA so the next VLA chunk starts clean
+                    # instead of blending against pre-macro action_chunk values.
+                    smooth = ActionSmoothingRuntime.start_episode(
+                        cfg.action_smoothing,
+                        te_k=cfg.te_k,
+                        ema_alpha=cfg.ema_alpha,
+                    )
+                    prev_use_actor = True
+
+                    if log_video and "exo_image" in obs_dict:
+                        ep_frames.append(
+                            _annotate_rollout_exo_frame(
+                                obs_dict["exo_image"],
+                                r_tot=float(ep_reward),
+                                r_step=macro_reward,
+                                phase_max=current_phase_max,
+                                use_actor=True,
+                                ep_steps=ep_steps,
+                                phase=int(macro_info.get("phase", 0)),
+                                g0_span=(
+                                    float(macro_info.get("g0_span"))
+                                    if "g0_span" in macro_info else None
+                                ),
+                                g1_span=(
+                                    float(macro_info.get("g1_span"))
+                                    if "g1_span" in macro_info else None
+                                ),
+                                yellow_lift_height=(
+                                    float(macro_info.get("yellow_lift_height"))
+                                    if "yellow_lift_height" in macro_info else None
+                                ),
+                                triggered_by="pyroki_macro",
+                            ),
+                        )
+                        last_video_phase_max = current_phase_max
+
+                    logger.info(
+                        "ep=%d: PyRoki macro completed inner_steps=%d "
+                        "reward=%.3f phase_max=%d done=%s skipped_reason=%s",
+                        episode, macro_inner_steps, macro_reward,
+                        current_phase_max, macro_done,
+                        macro_info.get("oracle_skipped_reason"),
+                    )
+
+                    if macro_done:
+                        done = True
+                        continue
+
+                    # Round ep_steps up to the next chunk boundary so the next
+                    # iteration's `ep_steps % infer_every == 0` block fires
+                    # cleanly and we don't try to execute a stale action_chunk
+                    # at a non-zero step_in_cycle.
+                    remainder = ep_steps % infer_every
+                    if remainder != 0:
+                        ep_steps += (infer_every - remainder)
+                    continue
 
             if ep_steps % infer_every == 0:
                 use_actor_now = _phase_use_actor(
@@ -1797,6 +2203,16 @@ def train(args: argparse.Namespace) -> None:
             ep_reward += reward
             ep_shaping_sum += float(info.get("shaping_reward", 0.0))
             ep_milestone_sum += float(info.get("milestone_reward", 0.0))
+            ep_lh_shortcut_penalty_sum += float(info.get("lh_shortcut_penalty", 0.0))
+            ep_lh_receiver_grasped_steps += int(float(info.get("lh_receiver_grasped", 0.0)) > 0.5)
+            ep_lh_blocked_no_receiver_grasp_steps += int(
+                float(info.get("lh_blocked_no_receiver_grasp", 0.0)) > 0.5
+            )
+            ep_shortcut_terminal = ep_shortcut_terminal or bool(
+                float(info.get("shortcut_terminal", 0.0)) > 0.5
+            )
+            ep_both_home_steps += int(float(info.get("both_arms_home", 0.0)) > 0.5)
+            ep_home_bonus_sum += float(info.get("home_success_bonus", 0.0))
             ep_actor_drove.append(bool(prev_use_actor))
             ep_in_replay_window.append(bool(in_replay_window_now))
             if prev_use_actor:
@@ -1888,14 +2304,22 @@ def train(args: argparse.Namespace) -> None:
 
         replay_ep_timesteps_post_trim = len(ep_z_rls)
         ep_success = bool(env.task_completed())
+        recent_phase_max.append(int(ep_phase_max))
         ep_tape_dropped = ep_tape_drop_triggered
         replay_eligible = len(ep_z_rls) >= cfg.rl_chunk_length
         # Apply the success-only filter during warm-up only. After warm-up we
         # always feed the buffer so the actor sees real failures (incl. drops).
         warmup_success_filter_active = cfg.replay_only_successful_episodes and is_warmup
+        # When the PyRoki oracle drove (or could have driven) this episode, do
+        # not insert into the replay buffer: the macro doesn't produce per-step
+        # 16D bimanual actions and we don't want the actor learning to imitate
+        # an in-episode mix of VLA + oracle transitions.
+        pyroki_suppress_replay = (
+            args.handover_controller == "pyroki" and pyroki_macro_succeeded
+        )
         insert_replay = replay_eligible and (
             not warmup_success_filter_active or ep_success
-        )
+        ) and not pyroki_suppress_replay
         replay_chunks_added_ep = 0
         if insert_replay:
             replay_chunks_added_ep = replay_buffer.add_chunk_with_subsampling(
@@ -1994,7 +2418,23 @@ def train(args: argparse.Namespace) -> None:
             "shaped/phase_max": ep_phase_max,
             "shaped/ep_shaping_reward": ep_shaping_sum,
             "shaped/ep_milestone_reward": ep_milestone_sum,
+            "shaped/ep_lh_shortcut_penalty": ep_lh_shortcut_penalty_sum,
+            "shaped/ep_lh_receiver_grasped_steps": float(ep_lh_receiver_grasped_steps),
+            "shaped/ep_lh_blocked_no_receiver_grasp_steps": float(
+                ep_lh_blocked_no_receiver_grasp_steps
+            ),
+            "shaped/shortcut_terminal": float(ep_shortcut_terminal),
+            "home/ep_both_arms_home_steps": float(ep_both_home_steps),
+            "home/ep_success_bonus_sum": float(ep_home_bonus_sum),
+            "env/tape_layout_index": float(tape_layout_idx_ep),
         }
+        if recent_phase_max:
+            recent_arr = np.asarray(recent_phase_max, dtype=np.int32)
+            log_dict["phase/recent_mean_phase_max"] = float(np.mean(recent_arr))
+            log_dict["phase/recent_reach_phase1_rate"] = float(np.mean(recent_arr >= 1))
+            log_dict["phase/recent_reach_phase3_rate"] = float(np.mean(recent_arr >= 3))
+            log_dict["phase/recent_reach_phase4_rate"] = float(np.mean(recent_arr >= 4))
+            log_dict["phase/recent_window_size"] = float(recent_arr.size)
         if cfg.phase_mode != "off":
             log_dict["phase/actor_steps"] = ep_actor_steps
             log_dict["phase/rl_window_steps"] = max(
@@ -2070,6 +2510,15 @@ def train(args: argparse.Namespace) -> None:
                 actor_lock=actor_lock,
                 phase_x=phase_x,
                 phase_y=phase_y,
+                handover_controller=args.handover_controller,
+                pyroki_oracle_kwargs=dict(
+                    x_shift=args.pyroki_x_shift,
+                    y_shift=args.pyroki_y_shift,
+                    angle_shift=args.pyroki_angle_shift,
+                    perturb_radius=args.pyroki_perturb_radius,
+                    seed=args.seed + 9000 + episode,
+                ),
+                pyroki_skip_on_arm0_pick=args.pyroki_skip_on_arm0_pick,
             )
             wandb.log(eval_metrics, step=episode)
             logger.info(
