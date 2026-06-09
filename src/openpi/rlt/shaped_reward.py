@@ -1,57 +1,42 @@
-"""Phase-aware shaped reward for the bimanual tape-handover task.
+"""Phase-aware shaped reward for the bimanual tape-handover task (lift_handover mode).
 
-Per-step reward is
+Per-step reward:
 
     r_t = milestone_bonus · max(0, phase_max_t − phase_max_{t−1})
-        + (potential_difference_term  if mode == "dense_sticky")
-        + success_bonus · I[task_completed at step t]
+        + lh_shortcut_penalty   (if anti-shortcut triggers, typically ≤ 0)
+        + success_bonus · I[effective_success at step t]
 
-Modes:
+Phases (PHASE_HANDOFF = 2 is skipped so milestone_bonus·Δphase pays correctly on 1→3):
 
-``lift_only`` (recommended starting point)
-    Single observable: is the yellow tape ``> lift_thresh`` above the table?
-    Phase taxonomy collapses to ``{0=on table, 1=lifted}``, with a final
-    ``PHASE_PLACE=4`` jump on success. Reward is the sticky milestone bonus
-    when the tape is first lifted, plus the success terminal. No grip or
-    proximity gating, so detection cannot silently fail on edge-case grasps.
-    This is the right default when downstream gating (e.g. swap to RLT
-    actor when the tape is off the table) only needs a single coarse signal.
+    PHASE_REACH  (0)  tape on table
+    PHASE_GRASP0 (1)  tape lifted; picker arm identified, still holding
+    PHASE_GRASP1 (3)  handover done — picker opened, receiver near+closed on tape
+    PHASE_PLACE  (4)  task success
 
-``lift_handover``
-    Tape lift height plus **which arm first grasps** while lifted. On the first
-    step the yellow tape is lifted, we record ``first_grasp_arm`` ∈ {0, 1} as the
-    arm whose gripper is closed alone; if both are closed that timestep we break
-    ties with the eef **closer to the yellow tape**. Phase taxonomy is
-    ``{0=on table, 1=lifted (pre-handoff), 3=lifted + *that* arm fully open +
-    the receiving arm grasping, 4=success}``
-    — phase ``2`` is skipped so ``milestone_bonus·Δphase_max`` still pays two
-    steps on 1→3 and ``end_actor_after_handover`` (``phase_max >= 3``) is unchanged.
-    Phase 3 means the **original holder** opened (not the idle arm that stayed
-    open throughout a robot1-led pick). After phase 3, ``end_on_tape_drop``
-    stays debounced like before.
+Phase detection for lift_handover
+----------------------------------
+On the first step the tape is lifted we record ``lift_handover_first_grasp_arm`` ∈ {0,1}
+as the arm whose gripper is closed alone; ties broken by eef distance to the tape.
+Phase 3 requires *that* arm to be fully open AND the other arm to be near+closed —
+simply opening the picker without the receiver grasping does not advance phase.
 
-``sticky``
-    Five monotone phases — reach, grasp0, handoff_pose, grasp1, place. Pure
-    step-function progress: reward fires only on phase advance + success.
-    More credit-assignment signal than ``lift_only`` but relies on grip- and
-    proximity-based detectors that can miss real progress (e.g. arm0 grasps
-    just outside ``near_thresh``).
+Anti-shortcut features
+-----------------------
+``lift_handover_shortcut_xy_thresh_m > 0``:
+    Add ``lift_handover_shortcut_penalty_per_step`` (set negative, e.g. -0.002) every
+    step where the tape is lifted, phase_max < PHASE_GRASP1, AND the yellow–duct XY
+    distance is below the threshold. Discourages throwing / sliding to goal.
 
-``dense_sticky``
-    ``sticky`` plus Ng-1999 potential-based difference shaping inside each
-    phase: ``r_smooth = γ Φ(s_{t+1}) − Φ(s_t)``. Optimality-preserving in
-    theory; in practice the dense gradient can fight credit assignment when
-    phase detection is noisy.
+``lift_handover_gate_success_bonus = True``:
+    When task success fires before phase_max reached PHASE_GRASP1, scale success_bonus
+    by ``lift_handover_shortcut_success_bonus_frac`` (e.g. 0.15) instead of paying full.
 
-Gripper / proximity gates in the multi-phase modes are intentionally
-conservative to avoid the upstream ``reward_shaping=True`` failure modes:
-
-- The upstream lift bonus rewards ``yellow_z > table+0.05`` regardless of grip,
-  so a slingshot off the table farms +0.5. We gate phase 1 on
-  ``g0_closed ∧ near0`` so the lift must come with a real grasp.
-- The upstream reach term keeps rewarding arm 0 ↔ yellow distance after the
-  handover, fighting the right behavior (arm 0 should release). We switch the
-  reach target to arm 1 in phase 2+, and reward arm-0 retreat in phase 3.
+Tape-drop early termination
+-----------------------------
+``tape_drop_episode_should_end`` detects when the tape fell back to the table after
+being lifted.  Pre-handover it requires 12 consecutive REACH steps; post-handover
+(phase_max >= PHASE_GRASP1) the check is suppressed to avoid false kills during
+placement.  See function docstring for details.
 """
 
 from __future__ import annotations
@@ -62,35 +47,25 @@ from typing import Any
 import numpy as np
 
 
-# Phase IDs (also used as "actor_task_phases" config values in stage B).
+# ---------------------------------------------------------------------------
+# Phase constants (also used as "actor_task_phases" config values in stage B)
+# ---------------------------------------------------------------------------
 PHASE_REACH = 0
 PHASE_GRASP0 = 1
-PHASE_HANDOFF = 2
+PHASE_HANDOFF = 2   # skipped in lift_handover, reserved for future use
 PHASE_GRASP1 = 3
 PHASE_PLACE = 4
 NUM_PHASES = 5
 
-# -----------------------------------------------------------------------------
-# Tape-drop early termination (``Stage2Config.end_on_tape_drop``)
-# -----------------------------------------------------------------------------
-# Before handover completes, several *consecutive* steps with ``phase_now ==
-# PHASE_REACH`` after ``phase_max >= PHASE_GRASP0`` mean the tape truly fell during
-# lift/handoff (short streak debounces phase-detector flicker; see constants below).
-#
-# After ``lift_handover`` reaches ``PHASE_GRASP1`` (=3), ``yellow_lifted`` /
-# ``phase_now`` can flicker below threshold while arm1 still holds the tape
-# during the place phase — the old instantaneous rule killed episodes around
-# ~100–200 steps with success_bonus never reached. We therefore **never** apply
-# that heuristic past handover in ``lift_handover`` mode.
-#
-# Pre-handover we still need debouncing: ``phase_now`` can flicker to REACH for a
-# handful of sim steps while the tape is mid-air (lift height near ``lift_thresh``,
-# or grip/near predicates briefly failing in ``sticky``/``dense_sticky``) even though
-# ``phase_max`` stays ≥ GRASP0. The old ``pre_streak=1`` rule terminated entire
-# episodes on single-frame misclassification. Match the same order of magnitude as
-# post-handover streak so drops remain detectable within ~0.3–0.8s at 20 Hz control.
+# ---------------------------------------------------------------------------
+# Tape-drop debounce streaks
+# ---------------------------------------------------------------------------
+# Pre-handover: 12 consecutive REACH steps after phase_max >= PHASE_GRASP0
+# debounces single-frame phase-detector flicker (~0.6 s at 20 Hz control).
+# Post-handover (phase_max >= PHASE_GRASP1): check is suppressed entirely
+# because yellow_lifted / phase_now can flicker while arm1 moves to place.
 TAPE_DROP_PRE_HANDOVER_STREAK = 12
-TAPE_DROP_POST_HANDOVER_STREAK = 16
+TAPE_DROP_POST_HANDOVER_STREAK = 16  # kept for callers that pass post_streak explicitly
 
 
 def tape_drop_episode_should_end(
@@ -106,18 +81,18 @@ def tape_drop_episode_should_end(
     """Whether to force episode termination because the tape fell back down.
 
     Returns ``(terminate_now, streak_next)``. The caller persists ``streak_next``
-    across env steps and resets both outputs on ``env.reset``.
+    across env steps and resets both on ``env.reset``.
 
-    Parameters mirror the rollout logic in ``scripts/train_rlt_stage2.py``:
-    ``phase_max_seen`` is the running max of ``info[\"phase_max\"]`` so far in
+    ``phase_max_seen`` is the running max of ``info["phase_max"]`` so far in
     the episode (including the current step).
     """
     if not end_on_tape_drop or phase_max_seen < PHASE_GRASP0:
         return False, 0
-    looks_like_drop = phase_now < PHASE_GRASP0
-    if not looks_like_drop:
+    if phase_now >= PHASE_GRASP0:
         return False, 0
 
+    # In lift_handover mode: never trigger after the handover is complete —
+    # arm1 can dip near the table during placement without meaning the tape dropped.
     if shaped_reward_mode == "lift_handover" and phase_max_seen >= PHASE_GRASP1:
         return False, 0
 
@@ -126,251 +101,190 @@ def tape_drop_episode_should_end(
     return (streak_next >= need, streak_next)
 
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
 @dataclass
 class ShapedRewardConfig:
     """Tunables for :func:`compute_shaped_reward`.
 
-    Defaults are chosen so a successful episode earns roughly
-    ``5 · milestone_bonus + success_bonus ≈ 3.5`` of *sticky* reward, with
-    additional dense-but-bounded contribution from the Ng-style potential
-    difference (typically O(0.1) per phase entered). The total order of
-    magnitude is intentionally similar to the BC-regularized actor loss so
-    neither term dominates.
+    A successful episode earns roughly ``2 · milestone_bonus + success_bonus``
+    (REACH→GRASP0 +0.5, GRASP0→GRASP1 +0.5, success +1.0 = 2.0 total by default).
     """
 
-    mode: str = "off"  # "off" | "lift_only" | "lift_handover" | "sticky" | "dense_sticky"
+    mode: str = "off"   # "off" | "lift_handover"
 
-    # Per-phase potential scale (Φ ∈ [0, h] for the active phase only).
-    reach_h: float = 0.20
-    grasp0_h: float = 0.20
-    handoff_h: float = 0.20
-    grasp1_h: float = 0.25
-    place_h: float = 0.30
-
-    # Discount used in the potential-difference shaping ``r = γ Φ' − Φ``.
-    # Should match ``Stage2Config.discount`` for theoretical optimality
-    # preservation, but small mismatches are fine in practice.
-    potential_discount: float = 0.99
-
-    # One-time bonus when ``phase_max`` advances. Multiplied by the number of
-    # phases skipped, so a 0→2 jump still pays both transitions.
+    # One-time bonus each time phase_max advances (multiplied by phases skipped).
     milestone_bonus: float = 0.50
-
-    # Added on the success step, in addition to whatever potential / milestone
-    # contributions land that same step.
+    # Terminal bonus on the effective-success step.
     success_bonus: float = 1.0
 
-    # Detector thresholds.
-    near_thresh: float = 0.04           # m, eef ↔ tape distance.
-    # Finger qpos span (= sum |qpos| over both fingers, range [0, 0.08] for
-    # PandaGripper) thresholds for "closed enough to be holding something" and
-    # "fully released". Yellow/duct tape are grasped across their narrow
-    # ~2.5 cm dimension (the ~9.5 cm diameter exceeds the gripper's ~8 cm
-    # max opening), giving span ≈ 0.025 mid-grasp. The previous 0.02 / 0.05
-    # defaults were tuned for fully-closed-empty and fully-open and **never
-    # fired during an actual tape grasp**, which prevented phase 1 from ever
-    # being detected: the only way phase_max advanced past 0 was the
-    # ``success → PHASE_PLACE`` shortcut, dumping all milestones into the
-    # final step. That broke (a) per-step shaped reward (ep_reward stayed at 0
-    # except for the success step), (b) ``end_on_tape_drop`` (gated on
-    # ``phase_max >= PHASE_GRASP0``), and (c) ``phase_mode=task_phase`` (gated
-    # on the same ``phase_max``).
-    # 0.06 captures any grasp ≤ ~3 cm thick + fully closed; 0.07 keeps a
-    # 0.06–0.07 hysteresis band so a partially-released grasp is not
-    # prematurely marked "open" (which would let Phase 3 fire before arm0
-    # has fully let go). Override per-task via ShapedRewardConfig if your
-    # objects are very different.
-    grip_closed_thresh: float = 0.06    # finger qpos span < threshold => closed/holding.
-    grip_open_thresh: float = 0.07      # finger qpos span > threshold => fully open.
-    # Lift detection threshold: yellow tape z must exceed ``table_top_z + lift_thresh``.
-    # 2 cm is small enough to fire reliably as soon as the tape leaves the table during
-    # a real grasp, but well above the ~5 mm of pose noise we see when it sits on the
-    # table after placement initialization.
+    # --- Detector thresholds ---
+    # eef ↔ tape distance (m) for "near enough to be grasping".
+    near_thresh: float = 0.04
+    # Finger qpos span = sum(|qpos|), range [0, 0.08] for PandaGripper.
+    # 0.06 captures any grasp ≤ ~3 cm thick; 0.07 hysteresis avoids premature
+    # "open" detection on a partially-released grasp.
+    grip_closed_thresh: float = 0.06
+    grip_open_thresh: float = 0.07
+    # Yellow tape z must exceed table_top_z + lift_thresh to count as lifted.
     lift_thresh: float = 0.02
-    handoff_y_thresh: float = 0.10      # |yellow_y - midline_y|.
-    midline_y: float = 0.0              # Y where the handoff is "between" the arms.
-    retreat_dist: float = 0.15          # Phase-3 target: arm0 at least this far from yellow.
 
-    # --- ``lift_handover`` optional anti-shortcut (discourage throwing / sliding to goal) ---
-    # When ``lift_handover_shortcut_xy_thresh_m > 0`` and ``lift_handover_shortcut_penalty_per_step
-    # != 0``, add that penalty each step while: tape is lifted, ``phase_max < PHASE_GRASP1`` (true
-    # handover not completed), and yellow↔duct **xy** distance is below the threshold. Set the
-    # penalty negative (e.g. -2e-3). Disabled when thresh is 0.
+    # --- Anti-shortcut (lift_handover) ---
+    # Per-step penalty when tape is lifted close to duct tape but handover not done.
+    # Set to a negative value (e.g. -0.002). Disabled when thresh is 0.
     lift_handover_shortcut_xy_thresh_m: float = 0.0
     lift_handover_shortcut_penalty_per_step: float = 0.0
-    # If True: when the env reports ``success`` but ``phase_max`` never reached ``PHASE_GRASP1``
-    # before the success step (shortcut / throw), scale ``success_bonus`` by
-    # ``lift_handover_shortcut_success_bonus_frac`` instead of paying the full bonus.
+    # Gate the success bonus: if success fires before PHASE_GRASP1, scale it by
+    # shortcut_success_bonus_frac instead (e.g. 0.15 means 15% of success_bonus).
     lift_handover_gate_success_bonus: bool = False
-    lift_handover_shortcut_success_bonus_frac: float = 0.0  # e.g. 0.15; 0.0 = no success bonus on shortcut
+    lift_handover_shortcut_success_bonus_frac: float = 0.0
 
-    # Tanh sharpness for distance potentials. Higher = steeper gradient near 0.
-    tanh_k: float = 10.0
 
+# ---------------------------------------------------------------------------
+# Per-episode state
+# ---------------------------------------------------------------------------
 
 @dataclass
 class PhaseTrackerState:
-    """Per-episode mutable state. Reset in ``RobosuiteRLTEnv.reset``."""
+    """Mutable per-episode state. Reset via ``RobosuiteRLTEnv.reset``."""
 
     phase_max: int = 0
     prev_phase_max: int = 0
-    # Last-step potential value for the Ng-1999 potential-difference shaping.
-    # Reset to the *current* potential at every phase transition (see
-    # :func:`compute_shaped_reward`) so phase-boundary discontinuities do not
-    # leak into ``r_smooth`` — milestone_bonus pays the transition instead.
-    prev_phi: float = 0.0
-    last_phase_for_phi: int = -1  # -1 forces a phi-reset on the first step.
-    # For diagnostics — number of steps spent at each phase_max.
+    # Per-phase step counters for diagnostics.
     steps_at_phase: list[int] = field(default_factory=lambda: [0] * NUM_PHASES)
-    # ``lift_handover`` only: which arm (0 or 1) first reads grasped while the
-    # tape is lifted; phase 3 requires *that* gripper's span to exceed
-    # ``grip_open_thresh`` (picker / original holder released).
+    # lift_handover: index (0 or 1) of the arm that first grasped while lifted.
+    # None until the tape is first seen lifted with a closed gripper.
     lift_handover_first_grasp_arm: int | None = None
 
 
+# ---------------------------------------------------------------------------
+# Sim read helpers
+# ---------------------------------------------------------------------------
+
 def _gripper_span(gripper_qpos: np.ndarray) -> float:
-    """Return ``sum(|qpos|)`` proxy for finger opening (0 closed, ~0.08 open)."""
+    """sum(|qpos|) proxy for finger opening: 0 = fully closed, ~0.08 = fully open."""
     return float(np.sum(np.abs(np.asarray(gripper_qpos, dtype=np.float64))))
 
 
-def _read_sim_pose(sim: Any, body_id: int) -> np.ndarray:
+def _read_body_pos(sim: Any, body_id: int) -> np.ndarray:
     return np.asarray(sim.data.body_xpos[body_id], dtype=np.float64)
 
 
-def _read_eef_pos(sim: Any, site_id: int) -> np.ndarray:
+def _read_site_pos(sim: Any, site_id: int) -> np.ndarray:
     return np.asarray(sim.data.site_xpos[site_id], dtype=np.float64)
 
 
-def compute_phase_now(
+# ---------------------------------------------------------------------------
+# Phase detection
+# ---------------------------------------------------------------------------
+
+def _read_sim_state(
     raw_obs: dict[str, Any],
     sim: Any,
     body_ids: dict[str, int],
     site_ids: dict[str, int],
     table_top_z: float,
     cfg: ShapedRewardConfig,
-    *,
-    phase_max: int,
-    success: bool,
-) -> tuple[int, dict[str, float]]:
-    """Detect which phase the current sim state belongs to.
-
-    Returns ``(phase_now, debug)``. ``phase_max`` is consulted only to gate
-    higher phases (a phase 3 detector requires ``phase_max >= 1``); detection
-    itself is otherwise stateless.
-    """
-    yellow = _read_sim_pose(sim, body_ids["yellow"])
-    duct = _read_sim_pose(sim, body_ids["duct"])
-    eef0 = _read_eef_pos(sim, site_ids["eef0"])
-    eef1 = _read_eef_pos(sim, site_ids["eef1"])
-
+) -> dict[str, Any]:
+    """Read all sim quantities needed for phase detection and reward into one dict."""
+    yellow = _read_body_pos(sim, body_ids["yellow"])
+    duct = _read_body_pos(sim, body_ids["duct"])
+    eef0 = _read_site_pos(sim, site_ids["eef0"])
+    eef1 = _read_site_pos(sim, site_ids["eef1"])
     g0_span = _gripper_span(raw_obs.get("robot0_gripper_qpos", np.zeros(2)))
     g1_span = _gripper_span(raw_obs.get("robot1_gripper_qpos", np.zeros(2)))
-
-    dist_e0_yellow = float(np.linalg.norm(eef0 - yellow))
-    dist_e1_yellow = float(np.linalg.norm(eef1 - yellow))
     yellow_lift_height = float(yellow[2] - table_top_z)
     yellow_lifted = yellow_lift_height > cfg.lift_thresh
-
-    debug = {
-        "dist_e0_yellow": dist_e0_yellow,
-        "dist_e1_yellow": dist_e1_yellow,
-        "dist_yellow_duct": float(np.linalg.norm(yellow[:2] - duct[:2])),
-        "yellow_lifted": float(yellow_lifted),
-        "yellow_lift_height": yellow_lift_height,
-        "yellow_y": float(yellow[1]),
+    dist_e0 = float(np.linalg.norm(eef0 - yellow))
+    dist_e1 = float(np.linalg.norm(eef1 - yellow))
+    return {
+        "yellow": yellow,
+        "duct": duct,
+        "eef0": eef0,
+        "eef1": eef1,
         "g0_span": g0_span,
         "g1_span": g1_span,
+        "yellow_lift_height": yellow_lift_height,
+        "yellow_lifted": yellow_lifted,
+        "yellow_y": float(yellow[1]),
+        "dist_e0_yellow": dist_e0,
+        "dist_e1_yellow": dist_e1,
+        "dist_yellow_duct": float(np.linalg.norm(yellow[:2] - duct[:2])),
+        "g0_closed": g0_span < cfg.grip_closed_thresh,
+        "g1_closed": g1_span < cfg.grip_closed_thresh,
+        "g0_open": g0_span > cfg.grip_open_thresh,
+        "g1_open": g1_span > cfg.grip_open_thresh,
+        "near0": dist_e0 < cfg.near_thresh,
+        "near1": dist_e1 < cfg.near_thresh,
     }
 
-    # Success terminal collapses everything to PHASE_PLACE regardless of mode.
-    if success:
-        return PHASE_PLACE, debug
 
-    # ``lift_only``: the simplest possible detector. Phase 1 = tape off the table.
-    # No grip / proximity coupling, so the detector cannot silently fail when an
-    # edge-case grasp keeps the gripper a few millimetres past ``near_thresh``.
-    if cfg.mode == "lift_only":
-        return (PHASE_GRASP0 if yellow_lifted else PHASE_REACH), debug
-
-    g0_closed = g0_span < cfg.grip_closed_thresh
-    g1_closed = g1_span < cfg.grip_closed_thresh
-    g0_open = g0_span > cfg.grip_open_thresh
-
-    # ``lift_handover``: REACH vs lifted placeholder only. Phase 3 is resolved in
-    # :func:`compute_shaped_reward` using ``lift_handover_first_grasp_arm`` so we
-    # wait for the **pick** arm to open, not whichever arm stayed idle-open.
-    if cfg.mode == "lift_handover":
-        if not yellow_lifted:
-            return PHASE_REACH, debug
-        return PHASE_GRASP0, debug
-    near0 = dist_e0_yellow < cfg.near_thresh
-    near1 = dist_e1_yellow < cfg.near_thresh
-
-    # Phase 3: arm1 has the tape, arm0 has released, tape still up.
-    if phase_max >= PHASE_GRASP0 and near1 and g1_closed and g0_open and yellow_lifted:
-        phase_now = PHASE_GRASP1
-    # Phase 2: tape lifted near midline (handoff zone). Requires arm0 already
-    # grasped at some point.
-    elif phase_max >= PHASE_GRASP0 and yellow_lifted and abs(yellow[1] - cfg.midline_y) < cfg.handoff_y_thresh:
-        phase_now = PHASE_HANDOFF
-    # Phase 1: arm0 has yellow + lifted off table.
-    elif near0 and g0_closed and yellow_lifted:
-        phase_now = PHASE_GRASP0
-    else:
-        phase_now = PHASE_REACH
-
-    return phase_now, debug
-
-
-def _phase_potential(
-    phase_now: int,
-    raw_obs: dict[str, Any],
-    sim: Any,
-    body_ids: dict[str, int],
-    site_ids: dict[str, int],
+def _update_lift_handover_phase(
+    s: dict[str, Any],
+    state: PhaseTrackerState,
     cfg: ShapedRewardConfig,
-) -> float:
-    """Smooth potential Φ for the *current* phase only.
+) -> tuple[int, bool, bool]:
+    """Compute phase_now for lift_handover mode and update first_grasp_arm in state.
 
-    Each phase has its own scalar in [0, ``h_phase``]; phases that are not
-    currently active contribute 0. This is what stops the policy from farming
-    e.g. reach reward by parking near yellow tape — once it grasps, reach
-    stops paying, and the only way to keep earning is to advance.
+    Returns ``(phase_now, receiver_grasped, handover_blocked_no_receiver_grasp)``.
+
+    Logic:
+        1. If tape not lifted → PHASE_REACH.
+        2. On first lifted step, record which arm is the picker (gripper closed alone;
+           ties broken by eef distance).
+        3. PHASE_GRASP1 when: tape lifted + picker opened + receiver near+closed.
+        4. Otherwise PHASE_GRASP0 (tape lifted, handover not yet complete).
+        ``handover_blocked_no_receiver_grasp`` is True when the picker has opened but
+        the receiver hasn't grasped yet — useful for diagnostics.
     """
-    yellow = _read_sim_pose(sim, body_ids["yellow"])
-    duct = _read_sim_pose(sim, body_ids["duct"])
-    eef0 = _read_eef_pos(sim, site_ids["eef0"])
-    eef1 = _read_eef_pos(sim, site_ids["eef1"])
-    k = cfg.tanh_k
+    if not s["yellow_lifted"]:
+        return PHASE_REACH, False, False
 
-    if phase_now == PHASE_REACH:
-        d = float(np.linalg.norm(eef0 - yellow))
-        return cfg.reach_h * (1.0 - float(np.tanh(k * d)))
+    # Record picker arm on first lifted step.
+    if state.lift_handover_first_grasp_arm is None:
+        if s["g0_closed"] and not s["g1_closed"]:
+            state.lift_handover_first_grasp_arm = 0
+        elif s["g1_closed"] and not s["g0_closed"]:
+            state.lift_handover_first_grasp_arm = 1
+        elif s["g0_closed"] and s["g1_closed"]:
+            state.lift_handover_first_grasp_arm = 0 if s["dist_e0_yellow"] <= s["dist_e1_yellow"] else 1
 
-    if phase_now == PHASE_GRASP0:
-        # Encourage moving the (held) tape toward the midline so the handoff
-        # zone becomes reachable for arm1.
-        dy = abs(float(yellow[1]) - cfg.midline_y)
-        return cfg.grasp0_h * (1.0 - float(np.tanh(k * dy)))
+    picker = state.lift_handover_first_grasp_arm
 
-    if phase_now == PHASE_HANDOFF:
-        d = float(np.linalg.norm(eef1 - yellow))
-        return cfg.handoff_h * (1.0 - float(np.tanh(k * d)))
+    if picker == 0:
+        receiver_grasped = bool(s["g1_closed"] and s["near1"])
+        picker_opened = bool(s["g0_open"])
+        handover_done = bool(
+            state.phase_max >= PHASE_GRASP0
+            and picker_opened and s["g1_closed"] and s["near1"]
+        )
+    elif picker == 1:
+        receiver_grasped = bool(s["g0_closed"] and s["near0"])
+        picker_opened = bool(s["g1_open"])
+        handover_done = bool(
+            state.phase_max >= PHASE_GRASP0
+            and picker_opened and s["g0_closed"] and s["near0"]
+        )
+    else:
+        # Picker arm not yet identified (tape just lifted this step, both open).
+        return PHASE_GRASP0, False, False
 
-    if phase_now == PHASE_GRASP1:
-        # Reward arm0 retreating away from the tape (so it doesn't fight arm1).
-        d = float(np.linalg.norm(eef0 - yellow))
-        progress = min(1.0, d / max(cfg.retreat_dist, 1e-6))
-        return cfg.grasp1_h * progress
+    if handover_done:
+        return PHASE_GRASP1, receiver_grasped, False
 
-    if phase_now == PHASE_PLACE:
-        d = float(np.linalg.norm(yellow[:2] - duct[:2]))
-        # Use 2x-scale tanh on placing so the gradient survives at the
-        # success threshold (~0.08 m). Otherwise tanh saturates earlier.
-        return cfg.place_h * (1.0 - float(np.tanh(k * 0.5 * d)))
+    blocked = bool(
+        state.phase_max >= PHASE_GRASP0
+        and picker_opened
+        and not receiver_grasped
+    )
+    return PHASE_GRASP0, receiver_grasped, blocked
 
-    return 0.0
 
+# ---------------------------------------------------------------------------
+# Main reward function
+# ---------------------------------------------------------------------------
 
 def compute_shaped_reward(
     *,
@@ -384,113 +298,39 @@ def compute_shaped_reward(
     state: PhaseTrackerState,
     cfg: ShapedRewardConfig,
 ) -> tuple[float, dict[str, Any]]:
-    """Single per-step reward evaluator.
+    """Compute per-step reward and advance phase tracker state.
 
-    Mutates ``state`` in place to advance ``phase_max`` and update
-    ``steps_at_phase``. Returns ``(reward, info)`` where ``info`` is suitable
-    for merging into ``env.step`` output.
+    Mutates ``state`` in place. Returns ``(reward, info)`` where ``info`` can be
+    merged directly into ``env.step`` output for logging.
+
+    Args:
+        success: Effective (gated) task success for this step — fires the success bonus
+            and collapses phase to PHASE_PLACE.
+        base_success: Raw robosuite success before any gate (handover / home-return).
+            Used only for the anti-shortcut penalty so it doesn't fire after placement.
     """
     phase_max_at_entry = int(state.phase_max)
     receiver_grasped = False
-    handover_blocked_no_receiver_grasp = False
-    phase_now, dbg = compute_phase_now(
-        raw_obs, sim, body_ids, site_ids, table_top_z, cfg,
-        phase_max=state.phase_max, success=success,
-    )
-    if cfg.mode == "lift_handover" and phase_now != PHASE_PLACE:
-        y_lift = float(dbg["yellow_lifted"]) >= 0.5
-        g0_span_v = float(dbg["g0_span"])
-        g1_span_v = float(dbg["g1_span"])
-        g0_open = g0_span_v > cfg.grip_open_thresh
-        g1_open = g1_span_v > cfg.grip_open_thresh
-        g0_closed = g0_span_v < cfg.grip_closed_thresh
-        g1_closed = g1_span_v < cfg.grip_closed_thresh
-        near0 = float(dbg["dist_e0_yellow"]) < float(cfg.near_thresh)
-        near1 = float(dbg["dist_e1_yellow"]) < float(cfg.near_thresh)
-        if y_lift and state.lift_handover_first_grasp_arm is None:
-            if g0_closed and not g1_closed:
-                state.lift_handover_first_grasp_arm = 0
-            elif g1_closed and not g0_closed:
-                state.lift_handover_first_grasp_arm = 1
-            elif g0_closed and g1_closed:
-                d0 = float(dbg["dist_e0_yellow"])
-                d1 = float(dbg["dist_e1_yellow"])
-                state.lift_handover_first_grasp_arm = 0 if d0 <= d1 else 1
+    handover_blocked = False
 
-        if state.lift_handover_first_grasp_arm == 0:
-            receiver_grasped = bool(g1_closed and near1)
-        elif state.lift_handover_first_grasp_arm == 1:
-            receiver_grasped = bool(g0_closed and near0)
+    s = _read_sim_state(raw_obs, sim, body_ids, site_ids, table_top_z, cfg)
 
-        if not y_lift:
-            phase_now = PHASE_REACH
-        elif (
-            state.phase_max >= PHASE_GRASP0
-            and state.lift_handover_first_grasp_arm is not None
-            and (
-                (
-                    state.lift_handover_first_grasp_arm == 0
-                    and g0_open
-                    and g1_closed
-                    and near1
-                )
-                or (
-                    state.lift_handover_first_grasp_arm == 1
-                    and g1_open
-                    and g0_closed
-                    and near0
-                )
-            )
-        ):
-            phase_now = PHASE_GRASP1
-        else:
-            handover_blocked_no_receiver_grasp = bool(
-                state.phase_max >= PHASE_GRASP0
-                and state.lift_handover_first_grasp_arm is not None
-                and (
-                    (
-                        state.lift_handover_first_grasp_arm == 0
-                        and g0_open
-                        and not receiver_grasped
-                    )
-                    or (
-                        state.lift_handover_first_grasp_arm == 1
-                        and g1_open
-                        and not receiver_grasped
-                    )
-                )
-            )
-            phase_now = PHASE_GRASP0
+    # Success collapses to PHASE_PLACE regardless of sensor state.
+    if success:
+        phase_now = PHASE_PLACE
+    elif cfg.mode == "lift_handover":
+        phase_now, receiver_grasped, handover_blocked = _update_lift_handover_phase(
+            s, state, cfg
+        )
+    else:
+        phase_now = PHASE_REACH  # mode == "off": no phase progression
+
     new_phase_max = max(state.phase_max, phase_now)
 
-    # --- Within-phase shaping ---
-    # ``sticky`` mode emits 0 inside a phase — only the sticky milestone bonus
-    # below pays for progress.  ``dense_sticky`` adds Ng-1999 potential-based
-    # difference shaping ``r_smooth = γ Φ(s_{t+1}) − Φ(s_t)``, which is
-    # optimality-preserving (Ng 1999 Theorem 1) but adds gradient noise from
-    # phase-detection flicker. We always *evaluate* Φ for logging.
-    phi_now = _phase_potential(phase_now, raw_obs, sim, body_ids, site_ids, cfg)
-    if cfg.mode == "dense_sticky":
-        if phase_now != state.last_phase_for_phi:
-            shaping = 0.0
-            state.prev_phi = phi_now
-            state.last_phase_for_phi = phase_now
-        else:
-            # One-sided potential shaping: only credit positive progress, never
-            # penalize stalling or transient decreases. Without this clamp,
-            # the (γ−1)·Φ stalling term accumulates ~−Φ·(1−γ) per step, which
-            # over a long episode (e.g. 1800 steps × 0.002 ≈ −3.6) dominates
-            # the +1.0 success bonus and makes successful slow episodes net
-            # *more negative* than fast failures.
-            raw_shaping = cfg.potential_discount * phi_now - state.prev_phi
-            shaping = max(0.0, raw_shaping)
-            state.prev_phi = phi_now
-    else:
-        shaping = 0.0
-        state.prev_phi = phi_now
-        state.last_phase_for_phi = phase_now
-
+    # --- Milestone bonus (fires once per phase advance) ---
     milestone = cfg.milestone_bonus * float(max(0, new_phase_max - state.prev_phase_max))
+
+    # --- Success bonus (optionally discounted on shortcuts) ---
     success_term = cfg.success_bonus if success else 0.0
     if (
         success
@@ -500,66 +340,72 @@ def compute_shaped_reward(
     ):
         success_term *= float(cfg.lift_handover_shortcut_success_bonus_frac)
 
+    # --- Anti-shortcut penalty ---
+    # Fires when tape is lifted and close to duct tape but handover not complete.
+    # Suppressed once base_success is True (tape already placed).
     lh_shortcut_penalty = 0.0
     if (
         cfg.mode == "lift_handover"
         and cfg.lift_handover_shortcut_xy_thresh_m > 0.0
         and cfg.lift_handover_shortcut_penalty_per_step != 0.0
+        and s["yellow_lifted"]
+        and new_phase_max < PHASE_GRASP1
+        and not bool(base_success)
+        and s["dist_yellow_duct"] < cfg.lift_handover_shortcut_xy_thresh_m
     ):
-        y_lift = float(dbg["yellow_lifted"]) >= 0.5
-        if y_lift and new_phase_max < PHASE_GRASP1 and not bool(base_success):
-            if float(dbg["dist_yellow_duct"]) < float(cfg.lift_handover_shortcut_xy_thresh_m):
-                lh_shortcut_penalty = float(cfg.lift_handover_shortcut_penalty_per_step)
+        lh_shortcut_penalty = float(cfg.lift_handover_shortcut_penalty_per_step)
 
-    reward = shaping + milestone + success_term + lh_shortcut_penalty
+    reward = milestone + success_term + lh_shortcut_penalty
 
+    # --- Advance state ---
     state.prev_phase_max = new_phase_max
     state.phase_max = new_phase_max
     state.steps_at_phase[phase_now] += 1
 
-    info = {
+    info: dict[str, Any] = {
         "phase": int(phase_now),
         "phase_max": int(new_phase_max),
-        "shaping_reward": float(shaping),
         "milestone_reward": float(milestone),
         "success_reward": float(success_term),
-        "phi_now": float(phi_now),
         "lh_shortcut_penalty": float(lh_shortcut_penalty),
-        **dbg,
+        # Sensor readings (logged to wandb).
+        "dist_e0_yellow": s["dist_e0_yellow"],
+        "dist_e1_yellow": s["dist_e1_yellow"],
+        "dist_yellow_duct": s["dist_yellow_duct"],
+        "yellow_lifted": float(s["yellow_lifted"]),
+        "yellow_lift_height": s["yellow_lift_height"],
+        "yellow_y": s["yellow_y"],
+        "g0_span": s["g0_span"],
+        "g1_span": s["g1_span"],
     }
     if cfg.mode == "lift_handover":
         fa = state.lift_handover_first_grasp_arm
         info["lh_first_grasp_arm"] = float(fa) if fa is not None else -1.0
         info["lh_receiver_grasped"] = float(receiver_grasped)
-        info["lh_blocked_no_receiver_grasp"] = float(handover_blocked_no_receiver_grasp)
+        info["lh_blocked_no_receiver_grasp"] = float(handover_blocked)
+
     return float(reward), info
 
 
-def _resolve_eef_site_id(robot: Any) -> int:
-    """Return the MJCF site ID for the robot's main end-effector.
+# ---------------------------------------------------------------------------
+# Sim handle caching (call once at env construction)
+# ---------------------------------------------------------------------------
 
-    ``robot.eef_site_id`` is a dict keyed by ``robot.arms`` (e.g. ``["right"]``
-    for a single-arm Panda, ``["right", "left"]`` for a Baxter). The bimanual
-    tape-handover env uses two single-arm Pandas in ``parallel`` configuration,
-    so each robot exposes exactly one arm. We pick the first arm in the dict to
-    stay agnostic to single- vs dual-arm robots.
+def _resolve_eef_site_id(robot: Any) -> int:
+    """Return the MuJoCo site ID for the robot's main end-effector.
+
+    Handles both dict-keyed (newer robosuite) and scalar (older) ``eef_site_id``.
     """
     eef = robot.eef_site_id
     if isinstance(eef, dict):
-        if "right" in eef:
-            return int(eef["right"])
-        # Fallback for any future single-arm robot whose key isn't "right".
-        return int(next(iter(eef.values())))
-    # Older robosuite revisions may expose a scalar; preserve that path.
+        return int(eef["right"]) if "right" in eef else int(next(iter(eef.values())))
     return int(eef)
 
 
 def cache_sim_handles(robosuite_env: Any) -> tuple[dict[str, int], dict[str, int], float]:
-    """Snapshot body / site IDs and the table top z used for lift detection.
+    """Snapshot body/site IDs and table-top z for lift detection.
 
-    Called once at env construction; the values are constant for the lifetime
-    of the underlying ``TwoArmTapeHandover`` instance (re-cache on hard reset
-    if the model is rebuilt — see ``RobosuiteRLTEnv.reset`` notes).
+    Call once at env construction (or after a hard reset that rebuilds the model).
     """
     body_ids = {
         "yellow": int(robosuite_env.yellow_tape_body_id),
@@ -569,7 +415,5 @@ def cache_sim_handles(robosuite_env: Any) -> tuple[dict[str, int], dict[str, int
         "eef0": _resolve_eef_site_id(robosuite_env.robots[0]),
         "eef1": _resolve_eef_site_id(robosuite_env.robots[1]),
     }
-    # ``table_offsets[0, 2]`` is the table-top z used everywhere upstream
-    # (placement initializer, lift bonus). Mirror that here.
     table_top_z = float(robosuite_env.table_offsets[0, 2])
     return body_ids, site_ids, table_top_z
